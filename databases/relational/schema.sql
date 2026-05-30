@@ -417,8 +417,10 @@ CREATE TABLE journey_feedback (
 -- ---------------------------------------------------------------------------
 -- I. Structured refund rules
 -- ---------------------------------------------------------------------------
-
-
+-- Because of the complexity of the system, we tend to keep these tables for further extension.
+-- (There's no related queries for refund lol
+-- Once we got more time, we will come back to improve it.
+/*
 CREATE TABLE refund_policies (
     policy_id     TEXT PRIMARY KEY,
     label         TEXT NOT NULL,
@@ -446,6 +448,7 @@ CREATE TABLE refund_policy_windows (
     admin_fee_usd                NUMERIC(10,2) NOT NULL DEFAULT 0 CHECK (admin_fee_usd >= 0),
     condition_text               TEXT NULL
 );
+*/
 
 -- ---------------------------------------------------------------------------
 -- H. Vector / RAG documents
@@ -739,6 +742,7 @@ EXECUTE FUNCTION trg_national_rail_bookings_update_func();
 
 
 -- 2. metro_travel_history View
+-- Similar to national_rail_bookings view
 CREATE OR REPLACE VIEW metro_travel_history AS
 SELECT
     tj.journey_id AS trip_id,
@@ -848,6 +852,8 @@ JOIN travel_orders to_tbl ON to_tbl.order_id = pt.order_id
 LEFT JOIN payment_instruments pi ON pi.payment_instrument_id = pt.payment_instrument_id;
 
 -- payments INSTEAD OF INSERT Trigger
+-- distinguishes between national rail and metro bookings by checking if booking_id or metro_trip_id is not null
+-- Then inserts the payment transaction into the payment_transactions table 
 CREATE OR REPLACE FUNCTION trg_payments_insert_func()
 RETURNS TRIGGER AS $$
 DECLARE
@@ -886,6 +892,7 @@ EXECUTE FUNCTION trg_payments_insert_func();
 
 
 -- 4. feedback View
+-- Similar to the method implemented for national_rail_bookings view
 CREATE OR REPLACE VIEW feedback AS
 SELECT
     jf.feedback_id,
@@ -930,7 +937,8 @@ INSTEAD OF INSERT ON feedback
 FOR EACH ROW
 EXECUTE FUNCTION trg_feedback_insert_func();
 
--- Triggers for registered_users INSERT
+-- 5. Triggers for registered_users INSERT
+-- Same as the last version
 CREATE OR REPLACE FUNCTION trg_registered_users_insert_func()
 RETURNS TRIGGER AS $$
 BEGIN
