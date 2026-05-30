@@ -1,4 +1,24 @@
--- TransitFlow relational schema.sql
+-- ============================================================
+--  STUDENT TASK — Design and create your relational tables here
+--
+--  Start from the mock data in train-mock-data/:
+--    metro_stations.json, national_rail_stations.json
+--    metro_schedules.json, national_rail_schedules.json
+--    national_rail_seat_layouts.json
+--    registered_users.json
+--    bookings.json, metro_travel_history.json
+--    payments.json, feedback.json
+--
+--  Think about:
+--    - What tables do you need?
+--    - What columns and data types?
+--    - Which fields are primary keys? Which are foreign keys?
+--    - What constraints make sense?
+--
+--  Apply your schema with:
+--    docker-compose down -v && docker-compose up -d
+-- ============================================================
+-- 0529 ver.
 -- Compatible with the current agent.py / databases/relational/queries.py table names.
 -- Design goal:
 --   1. Keep the Python query layer working with names such as metro_schedules,
@@ -24,6 +44,8 @@ DROP VIEW IF EXISTS user_credentials CASCADE;
 DROP VIEW IF EXISTS registered_users CASCADE;
 DROP VIEW IF EXISTS metro_travel_history CASCADE;
 DROP VIEW IF EXISTS national_rail_bookings CASCADE;
+DROP VIEW IF EXISTS payments CASCADE;
+DROP VIEW IF EXISTS feedback CASCADE;
 DROP VIEW IF EXISTS national_rail_seats CASCADE;
 DROP VIEW IF EXISTS national_rail_seat_layouts CASCADE;
 DROP VIEW IF EXISTS national_rail_fare_classes CASCADE;
@@ -81,14 +103,16 @@ CREATE TABLE lines (
     line_id        TEXT PRIMARY KEY,
     network_type   TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     line_name      TEXT NOT NULL,
-    is_active      BOOLEAN NOT NULL DEFAULT TRUE
+    is_active      BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT uq_lines_id_network UNIQUE (line_id, network_type)
 );
 
 CREATE TABLE stations (
     station_id      TEXT PRIMARY KEY,
     network_type    TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     station_name    TEXT NOT NULL,
-    is_active       BOOLEAN NOT NULL DEFAULT TRUE
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT uq_stations_id_network UNIQUE (station_id, network_type)
 );
 
 CREATE TABLE station_lines (
@@ -127,16 +151,20 @@ CREATE TABLE station_adjacencies (
 
 CREATE TABLE service_schedules (
     schedule_id             TEXT PRIMARY KEY,
-    line_id                 TEXT NOT NULL REFERENCES lines(line_id),
+    line_id                 TEXT NOT NULL,
     network_type            TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     service_type            TEXT NULL CHECK (service_type IS NULL OR service_type IN ('normal', 'express')),
     direction               TEXT NOT NULL,
-    origin_station_id       TEXT NOT NULL REFERENCES stations(station_id),
-    destination_station_id  TEXT NOT NULL REFERENCES stations(station_id),
+    origin_station_id       TEXT NOT NULL,
+    destination_station_id  TEXT NOT NULL,
     first_train_time        TIME NOT NULL,
     last_train_time         TIME NOT NULL,
     frequency_min           INTEGER NOT NULL CHECK (frequency_min > 0),
-    is_active               BOOLEAN NOT NULL DEFAULT TRUE
+    is_active               BOOLEAN NOT NULL DEFAULT TRUE,
+    CONSTRAINT uq_schedules_id_network UNIQUE (schedule_id, network_type),
+    CONSTRAINT fk_schedules_line_network FOREIGN KEY (line_id, network_type) REFERENCES lines(line_id, network_type) ON DELETE CASCADE,
+    CONSTRAINT fk_schedules_origin_station_network FOREIGN KEY (origin_station_id, network_type) REFERENCES stations(station_id, network_type),
+    CONSTRAINT fk_schedules_dest_station_network FOREIGN KEY (destination_station_id, network_type) REFERENCES stations(station_id, network_type)
 );
 
 CREATE TABLE schedule_operating_days (
@@ -146,13 +174,16 @@ CREATE TABLE schedule_operating_days (
 );
 
 CREATE TABLE schedule_stations (
-    schedule_id                  TEXT NOT NULL REFERENCES service_schedules(schedule_id) ON DELETE CASCADE,
+    schedule_id                  TEXT NOT NULL,
+    network_type                 TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     sequence_no                  INTEGER NOT NULL CHECK (sequence_no >= 1),
-    station_id                   TEXT NOT NULL REFERENCES stations(station_id),
+    station_id                   TEXT NOT NULL,
     stops_here                   BOOLEAN NOT NULL DEFAULT TRUE,
     travel_time_from_origin_min  INTEGER NOT NULL CHECK (travel_time_from_origin_min >= 0),
     PRIMARY KEY (schedule_id, sequence_no),
-    UNIQUE (schedule_id, station_id)
+    UNIQUE (schedule_id, station_id),
+    CONSTRAINT fk_schedule_stations_schedule_network FOREIGN KEY (schedule_id, network_type) REFERENCES service_schedules(schedule_id, network_type) ON DELETE CASCADE,
+    CONSTRAINT fk_schedule_stations_station_network FOREIGN KEY (station_id, network_type) REFERENCES stations(station_id, network_type)
 );
 
 -- ---------------------------------------------------------------------------
@@ -165,6 +196,12 @@ CREATE TABLE ticket_types (
     description   TEXT NULL,
     is_active     BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+INSERT INTO ticket_types (ticket_type, display_name, description) VALUES
+('single', 'Single Ticket', 'One-way travel between two stations'),
+('return', 'Return Ticket', 'Round-trip travel between two stations'),
+('day_pass', 'Day Pass', 'Unlimited travel for a single calendar day')
+ON CONFLICT (ticket_type) DO NOTHING;
 
 CREATE TABLE ticket_type_network_rules (
     ticket_type                   TEXT NOT NULL REFERENCES ticket_types(ticket_type) ON DELETE CASCADE,
@@ -199,11 +236,14 @@ CREATE TABLE schedule_fares (
 -- D. National rail seat layouts
 -- ---------------------------------------------------------------------------
 
+--  Debugging: making sure the search will focus on 'national_rail'
 CREATE TABLE seat_layouts (
     layout_id      TEXT PRIMARY KEY,
-    schedule_id    TEXT NOT NULL UNIQUE REFERENCES service_schedules(schedule_id) ON DELETE CASCADE,
+    schedule_id    TEXT NOT NULL UNIQUE,
+    network_type   TEXT NOT NULL DEFAULT 'national_rail' CHECK (network_type = 'national_rail'),
     layout_version TEXT NOT NULL DEFAULT '1.0',
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_seat_layouts_schedule_network FOREIGN KEY (schedule_id, network_type) REFERENCES service_schedules(schedule_id, network_type) ON DELETE CASCADE
 );
 
 CREATE TABLE seat_layout_coaches (
@@ -223,7 +263,8 @@ CREATE TABLE seat_layout_seats (
     seat_row     INTEGER NOT NULL CHECK (seat_row >= 1),
     seat_column  TEXT NOT NULL,
     UNIQUE (layout_id, seat_code),
-    UNIQUE (coach_id, seat_code)
+    UNIQUE (coach_id, seat_code),
+    CONSTRAINT uq_seat_coach UNIQUE (seat_pk, coach_id)
 );
 
 -- ---------------------------------------------------------------------------
@@ -307,18 +348,22 @@ CREATE TABLE travel_journeys (
     journey_status          TEXT NOT NULL CHECK (journey_status IN ('confirmed', 'completed', 'cancelled', 'refunded')),
     stops_travelled         INTEGER NULL CHECK (stops_travelled >= 0),
     allocated_amount_usd    NUMERIC(10,2) NOT NULL CHECK (allocated_amount_usd >= 0),
-    UNIQUE (order_id, journey_sequence_no)
+    day_pass_ref            TEXT NULL REFERENCES travel_journeys(journey_id) ON DELETE SET NULL,
+    UNIQUE (order_id, journey_sequence_no),
+    CONSTRAINT uq_journeys_id_sched_date UNIQUE (journey_id, schedule_id, travel_date)
 );
 
 CREATE TABLE rail_journey_reservations (
-    journey_id          TEXT PRIMARY KEY REFERENCES travel_journeys(journey_id) ON DELETE CASCADE,
-    schedule_id         TEXT NOT NULL REFERENCES service_schedules(schedule_id),
+    journey_id          TEXT PRIMARY KEY,
+    schedule_id         TEXT NOT NULL,
     travel_date         DATE NOT NULL,
     fare_class_code     TEXT NOT NULL CHECK (fare_class_code IN ('standard', 'first')),
-    coach_id            BIGINT NOT NULL REFERENCES seat_layout_coaches(coach_id) ON DELETE CASCADE,
-    seat_pk             BIGINT NOT NULL REFERENCES seat_layout_seats(seat_pk) ON DELETE CASCADE,
+    coach_id            BIGINT NOT NULL,
+    seat_pk             BIGINT NOT NULL,
     seat_reserved_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    reservation_status  TEXT NOT NULL CHECK (reservation_status IN ('active', 'cancelled'))
+    reservation_status  TEXT NOT NULL CHECK (reservation_status IN ('active', 'cancelled')),
+    CONSTRAINT fk_reservation_journey_sched_date FOREIGN KEY (journey_id, schedule_id, travel_date) REFERENCES travel_journeys(journey_id, schedule_id, travel_date) ON DELETE CASCADE,
+    CONSTRAINT fk_reservation_seat_coach FOREIGN KEY (seat_pk, coach_id) REFERENCES seat_layout_seats(seat_pk, coach_id) ON DELETE CASCADE
 );
 
 -- Implement the unique partial index, which means that only the active seat reservations 
@@ -372,6 +417,7 @@ CREATE TABLE journey_feedback (
 -- ---------------------------------------------------------------------------
 -- I. Structured refund rules
 -- ---------------------------------------------------------------------------
+
 
 CREATE TABLE refund_policies (
     policy_id     TEXT PRIMARY KEY,
@@ -462,7 +508,8 @@ SELECT
     station_id,
     sequence_no AS stop_order,
     travel_time_from_origin_min
-FROM schedule_stations;
+FROM schedule_stations
+WHERE network_type = 'metro';
 
 CREATE VIEW national_rail_schedules AS
 SELECT
@@ -484,7 +531,8 @@ SELECT
     station_id,
     sequence_no AS stop_order,
     travel_time_from_origin_min
-FROM schedule_stations;
+FROM schedule_stations
+WHERE network_type = 'national_rail';
 
 CREATE VIEW national_rail_fare_classes AS
 SELECT
@@ -540,6 +588,347 @@ FROM user_auth_credentials uac
 LEFT JOIN user_recovery_factors urf 
   ON urf.user_id = uac.user_id 
  AND urf.factor_type = 'security_question';
+
+-- ---------------------------------------------------------------------------
+-- Compatibility View Endpoints with INSTEAD OF triggers for Read/Write queries
+-- ---------------------------------------------------------------------------
+-- Implemented INSTEAD OF triggers for Read/Write queries to views, cuz I personally want to drop some burdens for revising queries.py
+-- If you find that there exist more appropriate ways to deal with it(eg. revise the queries.py), just go for it and inform Chris!
+
+-- 1. national_rail_bookings View
+CREATE OR REPLACE VIEW national_rail_bookings AS
+SELECT
+    tj.journey_id AS booking_id,
+    to_tbl.user_id,
+    tj.schedule_id,
+    tj.origin_station_id,
+    tj.destination_station_id,
+    tj.travel_date,
+    tj.departure_time,
+    to_tbl.product_type AS ticket_type,
+    rjr.fare_class_code AS fare_class,
+    sl.layout_id,
+    slc.coach_code AS coach,
+    sls.seat_code AS seat_id,
+    tj.stops_travelled,
+    tj.allocated_amount_usd AS amount_usd,
+    tj.journey_status AS status,
+    to_tbl.purchased_at AS booked_at,
+    tj.travelled_at
+FROM travel_journeys tj
+JOIN travel_orders to_tbl ON to_tbl.order_id = tj.order_id
+LEFT JOIN rail_journey_reservations rjr ON rjr.journey_id = tj.journey_id
+LEFT JOIN seat_layout_coaches slc ON slc.coach_id = rjr.coach_id
+LEFT JOIN seat_layout_seats sls ON sls.seat_pk = rjr.seat_pk
+LEFT JOIN seat_layouts sl ON sl.schedule_id = tj.schedule_id
+WHERE to_tbl.network_type = 'national_rail';
+
+-- national_rail_bookings INSTEAD OF INSERT Trigger
+-- if the app writes a new order of national rail ticket, the trigger will insert values into travel_orders, travel_journeys, 
+-- rail_journey_reservations, seat_layout_seats, seat_layouts in a transaction
+CREATE OR REPLACE FUNCTION trg_national_rail_bookings_insert_func()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_coach_id BIGINT;
+    v_seat_pk BIGINT;
+    v_order_id TEXT;
+BEGIN
+    v_order_id := CONCAT('ORD-', NEW.booking_id);
+
+    -- 1. Insert into travel_orders
+    INSERT INTO travel_orders (
+        order_id, order_code, user_id, network_type, product_type, order_status, total_amount_usd, purchased_at
+    ) VALUES (
+        v_order_id,
+        NEW.booking_id,
+        NEW.user_id,
+        'national_rail',
+        NEW.ticket_type,
+        NEW.status,
+        NEW.amount_usd,
+        COALESCE(NEW.booked_at, NOW())
+    ) ON CONFLICT (order_id) DO NOTHING;
+
+    -- 2. Insert into travel_journeys
+    INSERT INTO travel_journeys (
+        journey_id, order_id, journey_sequence_no, schedule_id, origin_station_id, destination_station_id,
+        travel_date, departure_time, travelled_at, journey_status, stops_travelled, allocated_amount_usd
+    ) VALUES (
+        NEW.booking_id,
+        v_order_id,
+        1,
+        NEW.schedule_id,
+        NEW.origin_station_id,
+        NEW.destination_station_id,
+        NEW.travel_date,
+        NEW.departure_time,
+        NEW.travelled_at,
+        NEW.status,
+        NEW.stops_travelled,
+        NEW.amount_usd
+    ) ON CONFLICT (journey_id) DO NOTHING;
+
+    -- 3. Find coach_id and seat_pk
+    SELECT coach_id INTO v_coach_id
+    FROM seat_layout_coaches
+    WHERE layout_id = NEW.layout_id AND coach_code = NEW.coach;
+
+    IF v_coach_id IS NOT NULL THEN
+        SELECT seat_pk INTO v_seat_pk
+        FROM seat_layout_seats
+        WHERE coach_id = v_coach_id AND seat_code = NEW.seat_id;
+
+        IF v_seat_pk IS NOT NULL THEN
+            -- 4. Insert into rail_journey_reservations
+            INSERT INTO rail_journey_reservations (
+                journey_id, schedule_id, travel_date, fare_class_code, coach_id, seat_pk, seat_reserved_at, reservation_status
+            ) VALUES (
+                NEW.booking_id,
+                NEW.schedule_id,
+                NEW.travel_date,
+                NEW.fare_class,
+                v_coach_id,
+                v_seat_pk,
+                COALESCE(NEW.booked_at, NOW()),
+                CASE WHEN NEW.status = 'cancelled' THEN 'cancelled'::TEXT ELSE 'active'::TEXT END
+            ) ON CONFLICT (journey_id) DO NOTHING;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_national_rail_bookings_insert
+INSTEAD OF INSERT ON national_rail_bookings
+FOR EACH ROW
+EXECUTE FUNCTION trg_national_rail_bookings_insert_func();
+
+-- national_rail_bookings INSTEAD OF UPDATE Trigger
+-- Also, updating booking_id will update the order_id to keep them in sync 
+CREATE OR REPLACE FUNCTION trg_national_rail_bookings_update_func()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE travel_journeys
+    SET journey_status = NEW.status,
+        travelled_at = NEW.travelled_at
+    WHERE journey_id = OLD.booking_id;
+
+    UPDATE travel_orders
+    SET order_status = NEW.status
+    WHERE order_id = CONCAT('ORD-', OLD.booking_id);
+
+    IF NEW.status = 'cancelled' THEN
+        UPDATE rail_journey_reservations
+        SET reservation_status = 'cancelled'
+        WHERE journey_id = OLD.booking_id;
+    ELSIF NEW.status = 'confirmed' THEN
+        UPDATE rail_journey_reservations
+        SET reservation_status = 'active'
+        WHERE journey_id = OLD.booking_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_national_rail_bookings_update
+INSTEAD OF UPDATE ON national_rail_bookings
+FOR EACH ROW
+EXECUTE FUNCTION trg_national_rail_bookings_update_func();
+
+
+-- 2. metro_travel_history View
+CREATE OR REPLACE VIEW metro_travel_history AS
+SELECT
+    tj.journey_id AS trip_id,
+    to_tbl.user_id,
+    tj.schedule_id,
+    tj.origin_station_id,
+    tj.destination_station_id,
+    tj.travel_date,
+    to_tbl.product_type AS ticket_type,
+    tj.day_pass_ref,
+    tj.stops_travelled,
+    tj.allocated_amount_usd AS amount_usd,
+    tj.journey_status AS status,
+    to_tbl.purchased_at AS purchased_at,
+    tj.travelled_at
+FROM travel_journeys tj
+JOIN travel_orders to_tbl ON to_tbl.order_id = tj.order_id
+WHERE to_tbl.network_type = 'metro';
+
+-- metro_travel_history INSTEAD OF INSERT Trigger
+CREATE OR REPLACE FUNCTION trg_metro_travel_history_insert_func()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_order_id TEXT;
+BEGIN
+    v_order_id := CONCAT('ORD-', NEW.trip_id);
+
+    -- 1. Insert into travel_orders
+    INSERT INTO travel_orders (
+        order_id, order_code, user_id, network_type, product_type, order_status, total_amount_usd, purchased_at
+    ) VALUES (
+        v_order_id,
+        NEW.trip_id,
+        NEW.user_id,
+        'metro',
+        NEW.ticket_type,
+        NEW.status,
+        NEW.amount_usd,
+        COALESCE(NEW.purchased_at, NOW())
+    ) ON CONFLICT (order_id) DO NOTHING;
+
+    -- 2. Insert into travel_journeys
+    INSERT INTO travel_journeys (
+        journey_id, order_id, journey_sequence_no, schedule_id, origin_station_id, destination_station_id,
+        travel_date, departure_time, travelled_at, journey_status, stops_travelled, allocated_amount_usd, day_pass_ref
+    ) VALUES (
+        NEW.trip_id,
+        v_order_id,
+        1,
+        NEW.schedule_id,
+        NEW.origin_station_id,
+        NEW.destination_station_id,
+        NEW.travel_date,
+        NULL,
+        NEW.travelled_at,
+        NEW.status,
+        NEW.stops_travelled,
+        NEW.amount_usd,
+        NEW.day_pass_ref
+    ) ON CONFLICT (journey_id) DO NOTHING;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_metro_travel_history_insert
+INSTEAD OF INSERT ON metro_travel_history
+FOR EACH ROW
+EXECUTE FUNCTION trg_metro_travel_history_insert_func();
+
+-- metro_travel_history INSTEAD OF UPDATE Trigger
+CREATE OR REPLACE FUNCTION trg_metro_travel_history_update_func()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE travel_journeys
+    SET day_pass_ref = NEW.day_pass_ref,
+        journey_status = NEW.status,
+        travelled_at = NEW.travelled_at
+    WHERE journey_id = OLD.trip_id;
+
+    UPDATE travel_orders
+    SET order_status = NEW.status
+    WHERE order_id = CONCAT('ORD-', OLD.trip_id);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_metro_travel_history_update
+INSTEAD OF UPDATE ON metro_travel_history
+FOR EACH ROW
+EXECUTE FUNCTION trg_metro_travel_history_update_func();
+
+
+-- 3. payments View
+CREATE OR REPLACE VIEW payments AS
+SELECT
+    pt.payment_id,
+    CASE WHEN to_tbl.network_type = 'national_rail' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS booking_id,
+    CASE WHEN to_tbl.network_type = 'metro' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS metro_trip_id,
+    pt.amount_usd,
+    COALESCE(pi.method_type, 'credit_card') AS method,
+    pt.payment_status AS status,
+    pt.processed_at AS paid_at
+FROM payment_transactions pt
+JOIN travel_orders to_tbl ON to_tbl.order_id = pt.order_id
+LEFT JOIN payment_instruments pi ON pi.payment_instrument_id = pt.payment_instrument_id;
+
+-- payments INSTEAD OF INSERT Trigger
+CREATE OR REPLACE FUNCTION trg_payments_insert_func()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_order_id TEXT;
+BEGIN
+    v_order_id := COALESCE(
+        CONCAT('ORD-', NEW.booking_id),
+        CONCAT('ORD-', NEW.metro_trip_id)
+    );
+
+    INSERT INTO payment_transactions (
+        payment_id, order_id, payment_instrument_id, transaction_type,
+        amount_usd, currency_code, payment_status, gateway_reference, processed_at
+    ) VALUES (
+        NEW.payment_id,
+        v_order_id,
+        NULL,
+        CASE WHEN NEW.status = 'refunded' THEN 'refund'::TEXT ELSE 'charge'::TEXT END,
+        NEW.amount_usd,
+        'USD',
+        NEW.status,
+        NULL,
+        COALESCE(NEW.paid_at, NOW())
+    ) ON CONFLICT (payment_id) DO UPDATE SET
+        payment_status = EXCLUDED.payment_status,
+        processed_at = EXCLUDED.processed_at;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_payments_insert
+INSTEAD OF INSERT ON payments
+FOR EACH ROW
+EXECUTE FUNCTION trg_payments_insert_func();
+
+
+-- 4. feedback View
+CREATE OR REPLACE VIEW feedback AS
+SELECT
+    jf.feedback_id,
+    jf.user_id,
+    CASE WHEN to_tbl.network_type = 'national_rail' THEN jf.journey_id ELSE NULL END AS booking_id,
+    CASE WHEN to_tbl.network_type = 'metro' THEN jf.journey_id ELSE NULL END AS metro_trip_id,
+    jf.rating,
+    jf.comment,
+    jf.submitted_at
+FROM journey_feedback jf
+JOIN travel_journeys tj ON tj.journey_id = jf.journey_id
+JOIN travel_orders to_tbl ON to_tbl.order_id = tj.order_id;
+
+-- feedback INSTEAD OF INSERT Trigger
+CREATE OR REPLACE FUNCTION trg_feedback_insert_func()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_journey_id TEXT;
+BEGIN
+    v_journey_id := COALESCE(NEW.booking_id, NEW.metro_trip_id);
+
+    INSERT INTO journey_feedback (
+        feedback_id, journey_id, user_id, rating, comment, submitted_at
+    ) VALUES (
+        NEW.feedback_id,
+        v_journey_id,
+        NEW.user_id,
+        NEW.rating,
+        NEW.comment,
+        COALESCE(NEW.submitted_at, NOW())
+    ) ON CONFLICT (feedback_id) DO UPDATE SET
+        rating = EXCLUDED.rating,
+        comment = EXCLUDED.comment,
+        submitted_at = EXCLUDED.submitted_at;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER trg_feedback_insert
+INSTEAD OF INSERT ON feedback
+FOR EACH ROW
+EXECUTE FUNCTION trg_feedback_insert_func();
 
 -- Triggers for registered_users INSERT
 CREATE OR REPLACE FUNCTION trg_registered_users_insert_func()
@@ -699,15 +1088,15 @@ ON seat_layout_seats (layout_id, seat_code);
 CREATE INDEX idx_seat_layout_seats_coach_row
 ON seat_layout_seats (coach_id, seat_row, seat_column);
 
--- Booking and history lookup
-CREATE INDEX idx_national_rail_bookings_user_time
-ON national_rail_bookings (user_id, travel_date DESC, booked_at DESC);
+-- Booking and history lookup (Optimized for normalized travel_orders and travel_journeys tables)
+CREATE INDEX idx_travel_orders_user_purchased
+ON travel_orders (user_id, purchased_at DESC);
 
-CREATE INDEX idx_national_rail_bookings_schedule_date_status
-ON national_rail_bookings (schedule_id, travel_date, status);
+CREATE INDEX idx_travel_journeys_sched_date_status
+ON travel_journeys (schedule_id, travel_date, journey_status);
 
-CREATE INDEX idx_metro_travel_history_user_time
-ON metro_travel_history (user_id, travel_date DESC, purchased_at DESC);
+CREATE INDEX idx_travel_journeys_travel_date
+ON travel_journeys (travel_date DESC);
 
 CREATE INDEX idx_payment_transactions_order
 ON payment_transactions (order_id);
