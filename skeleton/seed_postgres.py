@@ -95,6 +95,8 @@ def split_transaction_ref(ref):
 # ── seeders ──────────────────────────────────────────────────────────────────
 
 def seed_metro_stations(cur):
+    # TODO: Design your table schema, then implement the INSERT logic here.
+    # Each item in `data` is a dict — inspect the JSON to see available fields.
     data = load("metro_stations.json")
     
     # 1. Seed lines
@@ -129,7 +131,8 @@ def seed_metro_stations(cur):
 
 def seed_national_rail_stations(cur):
     data = load("national_rail_stations.json")
-    
+    # TODO: Design your table schema, then implement the INSERT logic here.
+
     # 1. Seed lines
     unique_lines = set()
     for station in data:
@@ -173,6 +176,7 @@ def seed_national_rail_stations(cur):
 
 def seed_metro_schedules(cur):
     data = load("metro_schedules.json")
+    # TODO: Design your table schema, then implement the INSERT logic here.
     
     # 1. Insert into service_schedules
     schedule_rows = [
