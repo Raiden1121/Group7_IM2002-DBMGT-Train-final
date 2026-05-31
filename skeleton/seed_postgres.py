@@ -116,15 +116,17 @@ def seed_metro_stations(cur):
     station_line_rows = []
     for station in data:
         for line in station.get("lines", []):
-            station_line_rows.append((station["station_id"], line))
-    n_station_lines = insert_many(cur, "station_lines", ["station_id", "line_id"], station_line_rows)
+            # network_type is required by the composite FK to keep metro station-line links scoped to metro.
+            station_line_rows.append((station["station_id"], line, "metro"))
+    n_station_lines = insert_many(cur, "station_lines", ["station_id", "line_id", "network_type"], station_line_rows)
     
     # 4. Seed station_adjacencies
     adjacency_rows = []
     for station in data:
         for adj in station.get("adjacent_stations", []):
-            adjacency_rows.append((station["station_id"], adj["station_id"], adj["line"], adj["travel_time_min"]))
-    n_adj = insert_many(cur, "station_adjacencies", ["from_station_id", "to_station_id", "line_id", "travel_time_min"], adjacency_rows)
+            # network_type enforces that both stations and the line are part of the metro network.
+            adjacency_rows.append((station["station_id"], adj["station_id"], adj["line"], "metro", adj["travel_time_min"]))
+    n_adj = insert_many(cur, "station_adjacencies", ["from_station_id", "to_station_id", "line_id", "network_type", "travel_time_min"], adjacency_rows)
     
     print(f"  metro_stations: seeded {n_lines} lines, {n_stations} stations, {n_station_lines} station_lines, {n_adj} adjacencies")
 
@@ -150,8 +152,9 @@ def seed_national_rail_stations(cur):
     station_line_rows = []
     for station in data:
         for line in station.get("lines", []):
-            station_line_rows.append((station["station_id"], line))
-    n_station_lines = insert_many(cur, "station_lines", ["station_id", "line_id"], station_line_rows)
+            # network_type is required by the composite FK to keep rail station-line links scoped to rail.
+            station_line_rows.append((station["station_id"], line, "national_rail"))
+    n_station_lines = insert_many(cur, "station_lines", ["station_id", "line_id", "network_type"], station_line_rows)
     
     # 4. Seed station_transfers
     transfer_rows = []
@@ -168,8 +171,9 @@ def seed_national_rail_stations(cur):
     adjacency_rows = []
     for station in data:
         for adj in station.get("adjacent_stations", []):
-            adjacency_rows.append((station["station_id"], adj["station_id"], adj["line"], adj["travel_time_min"]))
-    n_adj = insert_many(cur, "station_adjacencies", ["from_station_id", "to_station_id", "line_id", "travel_time_min"], adjacency_rows)
+            # network_type enforces that both stations and the line are part of the national rail network.
+            adjacency_rows.append((station["station_id"], adj["station_id"], adj["line"], "national_rail", adj["travel_time_min"]))
+    n_adj = insert_many(cur, "station_adjacencies", ["from_station_id", "to_station_id", "line_id", "network_type", "travel_time_min"], adjacency_rows)
     
     print(f"  national_rail_stations: seeded {n_lines} lines, {n_stations} stations, {n_station_lines} station_lines, {n_transfers} transfers, {n_adj} adjacencies")
 
@@ -243,13 +247,14 @@ def seed_metro_schedules(cur):
     
     # 4. Insert into schedule_fares
     fare_rows = [
-        (s["schedule_id"], "metro_single", s["base_fare_usd"], s["per_stop_rate_usd"], "USD")
+        # network_type is part of the fare schedule FK and restricts metro fares to metro_single.
+        (s["schedule_id"], "metro", "metro_single", s["base_fare_usd"], s["per_stop_rate_usd"], "USD")
         for s in data
     ]
     n_fares = insert_many(
         cur,
         "schedule_fares",
-        ["schedule_id", "fare_class_code", "base_fare_usd", "per_stop_rate_usd", "currency_code"],
+        ["schedule_id", "network_type", "fare_class_code", "base_fare_usd", "per_stop_rate_usd", "currency_code"],
         fare_rows
     )
     
@@ -329,6 +334,7 @@ def seed_national_rail_schedules(cur):
             fare_rows.append(
                 (
                     s["schedule_id"],
+                    "national_rail",
                     fare_class,
                     fare.get("base_fare_usd"),
                     fare.get("per_stop_rate_usd"),
@@ -338,7 +344,7 @@ def seed_national_rail_schedules(cur):
     n_fares = insert_many(
         cur,
         "schedule_fares",
-        ["schedule_id", "fare_class_code", "base_fare_usd", "per_stop_rate_usd", "currency_code"],
+        ["schedule_id", "network_type", "fare_class_code", "base_fare_usd", "per_stop_rate_usd", "currency_code"],
         fare_rows
     )
     
@@ -403,17 +409,38 @@ def seed_seat_layouts(cur):
 def seed_users(cur):
     data = load("registered_users.json")
     # TODO: Design your table schema, then implement the INSERT logic here.
+    # 1. Validate and prepare user profile / credential rows
     user_rows = []
     credential_rows = []
+    seen_emails = set()
     for user in data:
+        required_fields = ["user_id", "full_name", "email", "password", "date_of_birth"]
+        missing_fields = [field for field in required_fields if not user.get(field)]
+        if missing_fields:
+            raise ValueError(
+                f"registered_users.json record is missing {missing_fields}: user_id={user.get('user_id')}"
+            )
+
+        email = user["email"].lower()
+        if email in seen_emails:
+            raise ValueError(f"Duplicate registered user email after lower-casing: {email}")
+        seen_emails.add(email)
+
+        if bool(user.get("secret_question")) != bool(user.get("secret_answer")):
+            raise ValueError(
+                "Secret question and answer must be provided together for "
+                f"user_id={user['user_id']}"
+            )
+
         first_name, surname = split_full_name(user["full_name"])
+        # The registered_users view splits profile data from authentication data.
         user_rows.append(
             (
                 user["user_id"],
                 first_name,
                 surname,
                 user["full_name"],
-                user["email"].lower(),
+                email,
                 user.get("phone"),
                 user.get("date_of_birth"),
                 user.get("registered_at"),
@@ -428,8 +455,10 @@ def seed_users(cur):
                 "argon2id",
                 user.get("secret_question"),
                 hash_secret(user.get("secret_answer")),
+                user.get("registered_at"),
             )
         )
+    # 2. Insert user profile rows through the compatibility view
     users = insert_many(
         cur,
         "registered_users",
@@ -446,6 +475,7 @@ def seed_users(cur):
         ],
         user_rows,
     )
+    # 3. Insert authentication and recovery credential rows through the compatibility view
     credentials = insert_many(
         cur,
         "user_credentials",
@@ -455,6 +485,7 @@ def seed_users(cur):
             "hashing_algorithm",
             "secret_question",
             "secret_answer_hash",
+            "updated_at",
         ],
         credential_rows,
     )
@@ -465,20 +496,39 @@ def seed_users(cur):
 def seed_national_rail_bookings(cur):
     data = load("bookings.json")
     # TODO: Design your table schema, then implement the INSERT logic here.
+    # 1. Validate booking seat selections and prepare rows
     rows = []
     for booking in data:
         # layout_id is not present in bookings.json, so derive it from the schedule.
+        # The schema also requires the selected coach, seat, and fare class to match.
         cur.execute(
             """
-            SELECT layout_id
-            FROM national_rail_seat_layouts
-            WHERE schedule_id = %s
+            SELECT nrl.layout_id
+            FROM national_rail_seat_layouts nrl
+            JOIN national_rail_seats nrs
+              ON nrs.layout_id = nrl.layout_id
+            WHERE nrl.schedule_id = %s
+              AND nrs.coach = %s
+              AND nrs.seat_id = %s
+              AND nrs.fare_class = %s
             """,
-            (booking["schedule_id"],),
+            (
+                booking["schedule_id"],
+                booking["coach"],
+                booking["seat_id"],
+                booking["fare_class"],
+            ),
         )
         result = cur.fetchone()
         if result is None:
-            raise ValueError(f"No layout_id found for schedule_id={booking['schedule_id']}")
+            raise ValueError(
+                "No matching rail seat found for "
+                f"booking_id={booking['booking_id']}, "
+                f"schedule_id={booking['schedule_id']}, "
+                f"coach={booking['coach']}, "
+                f"seat_id={booking['seat_id']}, "
+                f"fare_class={booking['fare_class']}"
+            )
         layout_id = result[0]
         rows.append(
             (
@@ -501,6 +551,7 @@ def seed_national_rail_bookings(cur):
                 booking.get("travelled_at"),
             )
         )
+    # 2. Insert bookings through the compatibility view
     n = insert_many(
         cur,
         "national_rail_bookings",
@@ -531,25 +582,53 @@ def seed_national_rail_bookings(cur):
 def seed_metro_travels(cur):
     data = load("metro_travel_history.json")
     # TODO: Design your table schema, then implement the INSERT logic here.
+    # 1. Validate metro trips and prepare rows without day_pass_ref
     # Insert first with day_pass_ref cleared, then restore self-references afterwards.
-    rows = [
-        (
-            trip["trip_id"],
-            trip["user_id"],
-            trip["schedule_id"],
-            trip["origin_station_id"],
-            trip["destination_station_id"],
-            trip["travel_date"],
-            trip["ticket_type"],
-            None,
-            trip.get("stops_travelled"),
-            trip["amount_usd"],
-            trip["status"],
-            trip.get("purchased_at"),
-            trip.get("travelled_at"),
+    rows = []
+    for trip in data:
+        # The schema requires metro journeys to use a metro schedule and metro stations.
+        cur.execute(
+            """
+            SELECT 1
+            FROM metro_schedules ms
+            JOIN metro_stations origin_station
+              ON origin_station.station_id = %s
+            JOIN metro_stations dest_station
+              ON dest_station.station_id = %s
+            WHERE ms.schedule_id = %s
+            """,
+            (
+                trip["origin_station_id"],
+                trip["destination_station_id"],
+                trip["schedule_id"],
+            ),
         )
-        for trip in data
-    ]
+        if cur.fetchone() is None:
+            raise ValueError(
+                "No matching metro schedule/stops found for "
+                f"trip_id={trip['trip_id']}, "
+                f"schedule_id={trip['schedule_id']}, "
+                f"origin={trip['origin_station_id']}, "
+                f"destination={trip['destination_station_id']}"
+            )
+        rows.append(
+            (
+                trip["trip_id"],
+                trip["user_id"],
+                trip["schedule_id"],
+                trip["origin_station_id"],
+                trip["destination_station_id"],
+                trip["travel_date"],
+                trip["ticket_type"],
+                None,
+                trip.get("stops_travelled"),
+                trip["amount_usd"],
+                trip["status"],
+                trip.get("purchased_at"),
+                trip.get("travelled_at"),
+            )
+        )
+    # 2. Insert metro travel history rows through the compatibility view
     n = insert_many(
         cur,
         "metro_travel_history",
@@ -570,6 +649,7 @@ def seed_metro_travels(cur):
         ],
         rows,
     )
+    # 3. Restore day_pass_ref values after base trips exist
     update_count = 0
     for trip in data:
         if trip.get("day_pass_ref"):
@@ -581,6 +661,12 @@ def seed_metro_travels(cur):
                 """,
                 (trip["day_pass_ref"], trip["trip_id"]),
             )
+            if cur.rowcount != 1:
+                raise ValueError(
+                    "Failed to restore day_pass_ref for "
+                    f"trip_id={trip['trip_id']}, "
+                    f"day_pass_ref={trip['day_pass_ref']}"
+                )
             update_count += cur.rowcount
     print(f"  metro_travel_history: {n} rows")
     print(f"  metro_travel_history day_pass_ref updates: {update_count} rows")
@@ -589,10 +675,33 @@ def seed_metro_travels(cur):
 def seed_payments(cur):
     data = load("payments.json")
     # TODO: Design your table schema, then implement the INSERT logic here.
+    # 1. Validate payment references and prepare rows
     rows = []
     for payment in data:
         # Raw JSON uses one reference field for both rail bookings and metro trips.
         booking_id, metro_trip_id = split_transaction_ref(payment.get("booking_id"))
+        if booking_id:
+            cur.execute(
+                "SELECT 1 FROM national_rail_bookings WHERE booking_id = %s",
+                (booking_id,),
+            )
+            if cur.fetchone() is None:
+                raise ValueError(
+                    "No national rail booking found for "
+                    f"payment_id={payment['payment_id']}, booking_id={booking_id}"
+                )
+        elif metro_trip_id:
+            cur.execute(
+                "SELECT 1 FROM metro_travel_history WHERE trip_id = %s",
+                (metro_trip_id,),
+            )
+            if cur.fetchone() is None:
+                raise ValueError(
+                    "No metro trip found for "
+                    f"payment_id={payment['payment_id']}, metro_trip_id={metro_trip_id}"
+                )
+        else:
+            raise ValueError(f"Payment {payment['payment_id']} has no booking or metro trip reference")
         rows.append(
             (
                 payment["payment_id"],
@@ -604,6 +713,7 @@ def seed_payments(cur):
                 payment["paid_at"],
             )
         )
+    # 2. Insert payment rows through the compatibility view
     n = insert_many(
         cur,
         "payments",
@@ -616,10 +726,44 @@ def seed_payments(cur):
 def seed_feedback(cur):
     data = load("feedback.json")
     # TODO: Design your table schema, then implement the INSERT logic here.
+    # 1. Validate feedback references and prepare rows
     rows = []
     for item in data:
         # Feedback follows the same mixed BK/MT reference pattern as payments.
         booking_id, metro_trip_id = split_transaction_ref(item.get("booking_id"))
+        if booking_id:
+            cur.execute(
+                "SELECT user_id FROM national_rail_bookings WHERE booking_id = %s",
+                (booking_id,),
+            )
+            result = cur.fetchone()
+            ref_name = "booking_id"
+            ref_value = booking_id
+        elif metro_trip_id:
+            cur.execute(
+                "SELECT user_id FROM metro_travel_history WHERE trip_id = %s",
+                (metro_trip_id,),
+            )
+            result = cur.fetchone()
+            ref_name = "metro_trip_id"
+            ref_value = metro_trip_id
+        else:
+            raise ValueError(f"Feedback {item['feedback_id']} has no booking or metro trip reference")
+
+        if result is None:
+            raise ValueError(
+                "No travelled journey found for "
+                f"feedback_id={item['feedback_id']}, "
+                f"{ref_name}={ref_value}"
+            )
+        if result[0] != item["user_id"]:
+            raise ValueError(
+                "Feedback user does not match journey user for "
+                f"feedback_id={item['feedback_id']}, "
+                f"{ref_name}={ref_value}, "
+                f"feedback_user={item['user_id']}, "
+                f"journey_user={result[0]}"
+            )
         rows.append(
             (
                 item["feedback_id"],
@@ -631,6 +775,7 @@ def seed_feedback(cur):
                 item.get("submitted_at"),
             )
         )
+    # 2. Insert feedback rows through the compatibility view
     n = insert_many(
         cur,
         "feedback",
