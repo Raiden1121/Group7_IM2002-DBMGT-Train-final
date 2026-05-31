@@ -945,10 +945,13 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_order_id TEXT;
 BEGIN
-    v_order_id := COALESCE(
-        CONCAT('ORD-', NEW.booking_id),
-        CONCAT('ORD-', NEW.metro_trip_id)
-    );
+    IF NEW.booking_id IS NOT NULL AND NEW.booking_id <> '' THEN
+        v_order_id := CONCAT('ORD-', NEW.booking_id);
+    ELSIF NEW.metro_trip_id IS NOT NULL AND NEW.metro_trip_id <> '' THEN
+        v_order_id := CONCAT('ORD-', NEW.metro_trip_id);
+    ELSE
+        v_order_id := NULL;
+    END IF;
 
     INSERT INTO payment_transactions (
         payment_id, order_id, payment_instrument_id, transaction_type,
@@ -1198,12 +1201,12 @@ ON payment_transactions (order_id);
 CREATE INDEX idx_payment_instruments_user
 ON payment_instruments (user_id);
 
--- Refund policy lookup
-CREATE INDEX idx_refund_policies_lookup
-ON refund_policies (network_type, service_type, is_active);
+-- Refund policy lookup (Commented out because base tables are commented out)
+-- CREATE INDEX idx_refund_policies_lookup
+-- ON refund_policies (network_type, service_type, is_active);
 
-CREATE INDEX idx_refund_policy_windows_policy
-ON refund_policy_windows (policy_id, hours_before_departure_min, hours_before_departure_max);
+-- CREATE INDEX idx_refund_policy_windows_policy
+-- ON refund_policy_windows (policy_id, hours_before_departure_min, hours_before_departure_max);
 
 -- Policy vector search fallback index.
 -- For small seed data, sequential scan is fine.

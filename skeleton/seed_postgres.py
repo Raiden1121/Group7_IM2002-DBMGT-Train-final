@@ -96,174 +96,108 @@ def split_transaction_ref(ref):
 
 def seed_metro_stations(cur):
     data = load("metro_stations.json")
-    # TODO: Design your table schema, then implement the INSERT logic here.
-    # Each item in `data` is a dict — inspect the JSON to see available fields.
-    rows = [
-        (
-            station["station_id"],
-            station["name"],
-            station.get("lines", []),
-            station.get("is_interchange_metro", False),
-            station.get("interchange_metro_lines", []),
-            station.get("is_interchange_national_rail", False),
-            station.get("interchange_national_rail_station_id"),
-        )
-        for station in data
-    ]
-    n = insert_many(
-        cur,
-        "metro_stations",
-        [
-            "station_id",
-            "name",
-            "lines",
-            "is_interchange_metro",
-            "interchange_metro_lines",
-            "is_interchange_national_rail",
-            "interchange_national_rail_station_id",
-        ],
-        rows,
-    )
-    print(f"  metro_stations: {n} rows")
+    
+    # 1. Seed lines
+    unique_lines = set()
+    for station in data:
+        for line in station.get("lines", []):
+            unique_lines.add(line)
+            
+    line_rows = [(line, "metro", f"Metro {line}", True) for line in sorted(unique_lines)]
+    n_lines = insert_many(cur, "lines", ["line_id", "network_type", "line_name", "is_active"], line_rows)
+    
+    # 2. Seed stations
+    station_rows = [(station["station_id"], "metro", station["name"], True) for station in data]
+    n_stations = insert_many(cur, "stations", ["station_id", "network_type", "station_name", "is_active"], station_rows)
+    
+    # 3. Seed station_lines
+    station_line_rows = []
+    for station in data:
+        for line in station.get("lines", []):
+            station_line_rows.append((station["station_id"], line))
+    n_station_lines = insert_many(cur, "station_lines", ["station_id", "line_id"], station_line_rows)
+    
+    # 4. Seed station_adjacencies
+    adjacency_rows = []
+    for station in data:
+        for adj in station.get("adjacent_stations", []):
+            adjacency_rows.append((station["station_id"], adj["station_id"], adj["line"], adj["travel_time_min"]))
+    n_adj = insert_many(cur, "station_adjacencies", ["from_station_id", "to_station_id", "line_id", "travel_time_min"], adjacency_rows)
+    
+    print(f"  metro_stations: seeded {n_lines} lines, {n_stations} stations, {n_station_lines} station_lines, {n_adj} adjacencies")
 
 
 def seed_national_rail_stations(cur):
     data = load("national_rail_stations.json")
-    # TODO: Design your table schema, then implement the INSERT logic here.
-    station_rows = [
-        (
-            station["station_id"],
-            station["name"],
-            station.get("lines", []),
-            station.get("is_interchange_national_rail", False),
-            station.get("interchange_national_rail_lines", []),
-            station.get("is_interchange_metro", False),
-            station.get("interchange_metro_station_id"),
-        )
-        for station in data
-    ]
-    stations = insert_many(
-        cur,
-        "national_rail_stations",
-        [
-            "station_id",
-            "name",
-            "lines",
-            "is_interchange_national_rail",
-            "interchange_national_rail_lines",
-            "is_interchange_metro",
-            "interchange_metro_station_id",
-        ],
-        station_rows,
-    )
-
-    interchange_rows = [
-        (
-            station["interchange_metro_station_id"],
-            station["station_id"],
-            5,
-        )
-        for station in data
-        if station.get("is_interchange_metro") and station.get("interchange_metro_station_id")
-    ]
-    interchanges = insert_many(
-        cur,
-        "station_interchanges",
-        ["metro_station_id", "rail_station_id", "transfer_time_min"],
-        interchange_rows,
-    )
-    print(f"  national_rail_stations: {stations} rows")
-    print(f"  station_interchanges: {interchanges} rows")
+    
+    # 1. Seed lines
+    unique_lines = set()
+    for station in data:
+        for line in station.get("lines", []):
+            unique_lines.add(line)
+            
+    line_rows = [(line, "national_rail", f"National Rail {line}", True) for line in sorted(unique_lines)]
+    n_lines = insert_many(cur, "lines", ["line_id", "network_type", "line_name", "is_active"], line_rows)
+    
+    # 2. Seed stations
+    station_rows = [(station["station_id"], "national_rail", station["name"], True) for station in data]
+    n_stations = insert_many(cur, "stations", ["station_id", "network_type", "station_name", "is_active"], station_rows)
+    
+    # 3. Seed station_lines
+    station_line_rows = []
+    for station in data:
+        for line in station.get("lines", []):
+            station_line_rows.append((station["station_id"], line))
+    n_station_lines = insert_many(cur, "station_lines", ["station_id", "line_id"], station_line_rows)
+    
+    # 4. Seed station_transfers
+    transfer_rows = []
+    for station in data:
+        if station.get("is_interchange_metro") and station.get("interchange_metro_station_id"):
+            metro_id = station["interchange_metro_station_id"]
+            rail_id = station["station_id"]
+            transfer_rows.append((metro_id, rail_id, "metro_to_rail", 5, True))
+            transfer_rows.append((rail_id, metro_id, "rail_to_metro", 5, True))
+            
+    n_transfers = insert_many(cur, "station_transfers", ["from_station_id", "to_station_id", "transfer_type", "walking_time_min", "is_active"], transfer_rows)
+    
+    # 5. Seed station_adjacencies
+    adjacency_rows = []
+    for station in data:
+        for adj in station.get("adjacent_stations", []):
+            adjacency_rows.append((station["station_id"], adj["station_id"], adj["line"], adj["travel_time_min"]))
+    n_adj = insert_many(cur, "station_adjacencies", ["from_station_id", "to_station_id", "line_id", "travel_time_min"], adjacency_rows)
+    
+    print(f"  national_rail_stations: seeded {n_lines} lines, {n_stations} stations, {n_station_lines} station_lines, {n_transfers} transfers, {n_adj} adjacencies")
 
 
 def seed_metro_schedules(cur):
     data = load("metro_schedules.json")
-    # TODO: Design your table schema, then implement the INSERT logic here.
+    
+    # 1. Insert into service_schedules
     schedule_rows = [
         (
-            schedule["schedule_id"],
-            schedule["line"],
-            schedule.get("direction"),
-            schedule["origin_station_id"],
-            schedule["destination_station_id"],
-            schedule.get("first_train_time"),
-            schedule.get("last_train_time"),
-            schedule.get("base_fare_usd"),
-            schedule.get("per_stop_rate_usd"),
-            schedule.get("frequency_min"),
-            schedule.get("operates_on", []),
+            s["schedule_id"],
+            s["line"],
+            "metro",
+            None,
+            s["direction"],
+            s["origin_station_id"],
+            s["destination_station_id"],
+            s["first_train_time"],
+            s["last_train_time"],
+            s["frequency_min"],
+            True
         )
-        for schedule in data
+        for s in data
     ]
-    schedules = insert_many(
+    n_schedules = insert_many(
         cur,
-        "metro_schedules",
+        "service_schedules",
         [
             "schedule_id",
-            "line",
-            "direction",
-            "origin_station_id",
-            "destination_station_id",
-            "first_train_time",
-            "last_train_time",
-            "base_fare_usd",
-            "per_stop_rate_usd",
-            "frequency_min",
-            "operates_on",
-        ],
-        schedule_rows,
-    )
-
-    stop_rows = []
-    for schedule in data:
-        for idx, station_id in enumerate(schedule["stops_in_order"], start=1):
-            stop_rows.append(
-                (
-                    schedule["schedule_id"],
-                    idx,
-                    station_id,
-                    schedule["travel_time_from_origin_min"].get(station_id),
-                )
-            )
-    stops = insert_many(
-        cur,
-        "metro_schedule_stops",
-        [
-            "schedule_id",
-            "stop_order",
-            "station_id",
-            "travel_time_from_origin_min",
-        ],
-        stop_rows,
-    )
-    print(f"  metro_schedules: {schedules} rows")
-    print(f"  metro_schedule_stops: {stops} rows")
-
-
-def seed_national_rail_schedules(cur):
-    data = load("national_rail_schedules.json")
-    # TODO: Design your table schema, then implement the INSERT logic here.
-    schedule_rows = [
-        (
-            schedule["schedule_id"],
-            schedule["line"],
-            schedule.get("service_type"),
-            schedule.get("direction"),
-            schedule["origin_station_id"],
-            schedule["destination_station_id"],
-            schedule.get("first_train_time"),
-            schedule.get("last_train_time"),
-            schedule.get("frequency_min"),
-            schedule.get("operates_on", []),
-        )
-        for schedule in data
-    ]
-    schedules = insert_many(
-        cur,
-        "national_rail_schedules",
-        [
-            "schedule_id",
-            "line",
+            "line_id",
+            "network_type",
             "service_type",
             "direction",
             "origin_station_id",
@@ -271,108 +205,195 @@ def seed_national_rail_schedules(cur):
             "first_train_time",
             "last_train_time",
             "frequency_min",
-            "operates_on",
+            "is_active"
         ],
-        schedule_rows,
+        schedule_rows
     )
-
+    
+    # 2. Insert into schedule_operating_days
+    operating_day_rows = []
+    for s in data:
+        for day in s.get("operates_on", []):
+            operating_day_rows.append((s["schedule_id"], day))
+    n_days = insert_many(cur, "schedule_operating_days", ["schedule_id", "day_of_week"], operating_day_rows)
+    
+    # 3. Insert into schedule_stations
     stop_rows = []
+    for s in data:
+        for idx, station_id in enumerate(s["stops_in_order"], start=1):
+            travel_time = s["travel_time_from_origin_min"].get(station_id, 0)
+            stop_rows.append((s["schedule_id"], "metro", idx, station_id, True, travel_time))
+    n_stops = insert_many(
+        cur,
+        "schedule_stations",
+        [
+            "schedule_id",
+            "network_type",
+            "sequence_no",
+            "station_id",
+            "stops_here",
+            "travel_time_from_origin_min"
+        ],
+        stop_rows
+    )
+    
+    # 4. Insert into schedule_fares
+    fare_rows = [
+        (s["schedule_id"], "metro_single", s["base_fare_usd"], s["per_stop_rate_usd"], "USD")
+        for s in data
+    ]
+    n_fares = insert_many(
+        cur,
+        "schedule_fares",
+        ["schedule_id", "fare_class_code", "base_fare_usd", "per_stop_rate_usd", "currency_code"],
+        fare_rows
+    )
+    
+    print(f"  metro_schedules: seeded {n_schedules} schedules, {n_days} operating days, {n_stops} stops, {n_fares} fares")
+
+
+def seed_national_rail_schedules(cur):
+    data = load("national_rail_schedules.json")
+    
+    # 1. Insert into service_schedules
+    schedule_rows = [
+        (
+            s["schedule_id"],
+            s["line"],
+            "national_rail",
+            s.get("service_type"),
+            s["direction"],
+            s["origin_station_id"],
+            s["destination_station_id"],
+            s["first_train_time"],
+            s["last_train_time"],
+            s["frequency_min"],
+            True
+        )
+        for s in data
+    ]
+    n_schedules = insert_many(
+        cur,
+        "service_schedules",
+        [
+            "schedule_id",
+            "line_id",
+            "network_type",
+            "service_type",
+            "direction",
+            "origin_station_id",
+            "destination_station_id",
+            "first_train_time",
+            "last_train_time",
+            "frequency_min",
+            "is_active"
+        ],
+        schedule_rows
+    )
+    
+    # 2. Insert into schedule_operating_days
+    operating_day_rows = []
+    for s in data:
+        for day in s.get("operates_on", []):
+            operating_day_rows.append((s["schedule_id"], day))
+    n_days = insert_many(cur, "schedule_operating_days", ["schedule_id", "day_of_week"], operating_day_rows)
+    
+    # 3. Insert into schedule_stations
+    stop_rows = []
+    for s in data:
+        for idx, station_id in enumerate(s["stops_in_order"], start=1):
+            travel_time = s["travel_time_from_origin_min"].get(station_id, 0)
+            stop_rows.append((s["schedule_id"], "national_rail", idx, station_id, True, travel_time))
+    n_stops = insert_many(
+        cur,
+        "schedule_stations",
+        [
+            "schedule_id",
+            "network_type",
+            "sequence_no",
+            "station_id",
+            "stops_here",
+            "travel_time_from_origin_min"
+        ],
+        stop_rows
+    )
+    
+    # 4. Insert into schedule_fares
     fare_rows = []
-    for schedule in data:
-        for idx, station_id in enumerate(schedule["stops_in_order"], start=1):
-            stop_rows.append(
-                (
-                    schedule["schedule_id"],
-                    idx,
-                    station_id,
-                    schedule["travel_time_from_origin_min"].get(station_id),
-                )
-            )
-        for fare_class, fare in schedule.get("fare_classes", {}).items():
+    for s in data:
+        for fare_class, fare in s.get("fare_classes", {}).items():
             fare_rows.append(
                 (
-                    schedule["schedule_id"],
+                    s["schedule_id"],
                     fare_class,
                     fare.get("base_fare_usd"),
                     fare.get("per_stop_rate_usd"),
+                    "USD"
                 )
             )
-    stops = insert_many(
+    n_fares = insert_many(
         cur,
-        "national_rail_schedule_stops",
-        [
-            "schedule_id",
-            "stop_order",
-            "station_id",
-            "travel_time_from_origin_min",
-        ],
-        stop_rows,
+        "schedule_fares",
+        ["schedule_id", "fare_class_code", "base_fare_usd", "per_stop_rate_usd", "currency_code"],
+        fare_rows
     )
-    fares = insert_many(
-        cur,
-        "national_rail_fare_classes",
-        ["schedule_id", "fare_class", "base_fare_usd", "per_stop_rate_usd"],
-        fare_rows,
-    )
-    print(f"  national_rail_schedules: {schedules} rows")
-    print(f"  national_rail_schedule_stops: {stops} rows")
-    print(f"  national_rail_fare_classes: {fares} rows")
+    
+    print(f"  national_rail_schedules: seeded {n_schedules} schedules, {n_days} operating days, {n_stops} stops, {n_fares} fares")
 
 
 def seed_seat_layouts(cur):
     data = load("national_rail_seat_layouts.json")
-    # TODO: Design your table schema, then implement the INSERT logic here.
-    layout_rows = [
-        (
-            layout["layout_id"],
-            layout["schedule_id"],
-        )
-        for layout in data
-    ]
-    layouts = insert_many(
-        cur,
-        "national_rail_seat_layouts",
-        ["layout_id", "schedule_id"],
-        layout_rows,
-    )
-
-    coach_rows = []
+    
+    # 1. Seed layouts
+    layout_rows = [(layout["layout_id"], layout["schedule_id"]) for layout in data]
+    n_layouts = insert_many(cur, "seat_layouts", ["layout_id", "schedule_id"], layout_rows)
+    
+    n_coaches = 0
     seat_rows = []
+    
+    # 2. Seed coaches and gather seats
     for layout in data:
+        layout_id = layout["layout_id"]
         for coach in layout.get("coaches", []):
-            coach_rows.append(
-                (
-                    layout["layout_id"],
-                    coach["coach"],
-                    coach.get("fare_class"),
-                )
+            coach_code = coach["coach"]
+            fare_class = coach["fare_class"]
+            
+            # Insert coach idempotently
+            cur.execute(
+                """
+                INSERT INTO seat_layout_coaches (layout_id, coach_code, fare_class_code)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (layout_id, coach_code) DO NOTHING
+                RETURNING coach_id;
+                """,
+                (layout_id, coach_code, fare_class)
             )
-            for seat in coach.get("seats", []):
-                seat_rows.append(
-                    (
-                        layout["layout_id"],
-                        coach["coach"],
-                        seat["seat_id"],
-                        seat.get("row"),
-                        seat.get("column"),
-                        coach.get("fare_class"),
-                    )
+            res = cur.fetchone()
+            if res:
+                coach_id = res[0]
+                n_coaches += 1
+            else:
+                cur.execute(
+                    """
+                    SELECT coach_id FROM seat_layout_coaches
+                    WHERE layout_id = %s AND coach_code = %s;
+                    """,
+                    (layout_id, coach_code)
                 )
-    coaches = insert_many(
+                coach_id = cur.fetchone()[0]
+                
+            for seat in coach.get("seats", []):
+                seat_rows.append((layout_id, coach_id, seat["seat_id"], seat["row"], seat["column"]))
+                
+    # 3. Seed seats
+    n_seats = insert_many(
         cur,
-        "national_rail_coaches",
-        ["layout_id", "coach", "fare_class"],
-        coach_rows,
+        "seat_layout_seats",
+        ["layout_id", "coach_id", "seat_code", "seat_row", "seat_column"],
+        seat_rows
     )
-    seats = insert_many(
-        cur,
-        "national_rail_seats",
-        ["layout_id", "coach", "seat_id", "seat_row", "seat_column", "fare_class"],
-        seat_rows,
-    )
-    print(f"  national_rail_seat_layouts: {layouts} rows")
-    print(f"  national_rail_coaches: {coaches} rows")
-    print(f"  national_rail_seats: {seats} rows")
+    
+    print(f"  seat_layouts: seeded {n_layouts} layouts, {n_coaches} new coaches, {n_seats} seats")
 
 
 def seed_users(cur):
