@@ -150,9 +150,21 @@ CREATE TABLE stations (
 CREATE TABLE station_lines (
     -- [PK design decision: Composite] Composite primary key defined by the station and route together, naturally unique
     -- [FK cascade behaviour: ON DELETE CASCADE] When the corresponding station or route is hard deleted, its subordinate relationship with the station and route is no longer meaningful, so it is cascaded and deleted
-    station_id  TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
-    line_id     TEXT NOT NULL REFERENCES lines(line_id) ON DELETE CASCADE,
-    PRIMARY KEY (station_id, line_id)
+    station_id    TEXT NOT NULL,
+    line_id       TEXT NOT NULL,
+    network_type  TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
+
+    PRIMARY KEY (station_id, line_id),
+
+    CONSTRAINT fk_station_lines_station_network
+        FOREIGN KEY (station_id, network_type)
+        REFERENCES stations(station_id, network_type)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_station_lines_line_network
+        FOREIGN KEY (line_id, network_type)
+        REFERENCES lines(line_id, network_type)
+        ON DELETE CASCADE
 );
 
 -- Cross-network transfer, e.g. MS01 <-> NR01.
@@ -160,14 +172,37 @@ CREATE TABLE station_lines (
 CREATE TABLE station_transfers (
     -- [PK design decision: Composite] Composite primary key, uniquely identifying the transfer path from station A to station B
     -- [FK cascade behaviour: ON DELETE CASCADE] When a station is hard deleted, the related transfer path definition is also deleted
-    from_station_id   TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
-    to_station_id     TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
-    transfer_type     TEXT NOT NULL CHECK (
+    from_station_id    TEXT NOT NULL,
+    to_station_id      TEXT NOT NULL,
+    transfer_type      TEXT NOT NULL CHECK (
         transfer_type IN ('metro_to_rail', 'rail_to_metro', 'metro_to_metro', 'rail_to_rail')
     ),
-    walking_time_min  INTEGER NOT NULL DEFAULT 0 CHECK (walking_time_min >= 0),
-    is_active         BOOLEAN NOT NULL DEFAULT TRUE,
-    PRIMARY KEY (from_station_id, to_station_id)
+    -- Generated from transfer_type so existing inserts still provide only station IDs and transfer_type.
+    from_network_type  TEXT GENERATED ALWAYS AS (
+        CASE
+            WHEN transfer_type IN ('metro_to_rail', 'metro_to_metro') THEN 'metro'
+            WHEN transfer_type IN ('rail_to_metro', 'rail_to_rail') THEN 'national_rail'
+        END
+    ) STORED,
+    to_network_type    TEXT GENERATED ALWAYS AS (
+        CASE
+            WHEN transfer_type IN ('metro_to_rail', 'rail_to_rail') THEN 'national_rail'
+            WHEN transfer_type IN ('rail_to_metro', 'metro_to_metro') THEN 'metro'
+        END
+    ) STORED,
+    walking_time_min   INTEGER NOT NULL DEFAULT 0 CHECK (walking_time_min >= 0),
+    is_active          BOOLEAN NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (from_station_id, to_station_id),
+
+    CONSTRAINT fk_transfer_from_station_network
+        FOREIGN KEY (from_station_id, from_network_type)
+        REFERENCES stations(station_id, network_type)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_transfer_to_station_network
+        FOREIGN KEY (to_station_id, to_network_type)
+        REFERENCES stations(station_id, network_type)
+        ON DELETE CASCADE
 );
 
 -- Directed adjacency: A -> B and B -> A should be inserted as separate rows.
@@ -175,11 +210,28 @@ CREATE TABLE station_adjacencies (
     -- [PK design decision: BIGSERIAL] Using Bigserial as the surrogate primary key for high-frequency network edges improves join performance
     adjacency_id      BIGSERIAL PRIMARY KEY,
     -- [FK cascade behaviour: ON DELETE CASCADE] When the subordinate station or route is hard deleted, the adjacency edge is also cascaded and deleted
-    from_station_id   TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
-    to_station_id     TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
-    line_id           TEXT NOT NULL REFERENCES lines(line_id) ON DELETE CASCADE,
+    from_station_id   TEXT NOT NULL,
+    to_station_id     TEXT NOT NULL,
+    line_id           TEXT NOT NULL,
+    network_type      TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     travel_time_min   INTEGER NOT NULL CHECK (travel_time_min > 0),
     is_active         BOOLEAN NOT NULL DEFAULT TRUE,
+
+    CONSTRAINT fk_adj_from_station_network
+        FOREIGN KEY (from_station_id, network_type)
+        REFERENCES stations(station_id, network_type)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_adj_to_station_network
+        FOREIGN KEY (to_station_id, network_type)
+        REFERENCES stations(station_id, network_type)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_adj_line_network
+        FOREIGN KEY (line_id, network_type)
+        REFERENCES lines(line_id, network_type)
+        ON DELETE CASCADE,
+
     UNIQUE (from_station_id, to_station_id, line_id)
 );
 
@@ -243,6 +295,7 @@ CREATE TABLE ticket_types (
     display_name  TEXT NOT NULL,
     description   TEXT NULL,
     -- [Delete strategy: Soft Delete] Setting is_active to FALSE when a ticket type is retired and discontinued allows historical orders to be traced back to their fare attributes.
+    is_active     BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 INSERT INTO ticket_types (ticket_type, display_name, description) VALUES
@@ -270,18 +323,49 @@ CREATE TABLE ticket_type_network_rules (
     PRIMARY KEY (ticket_type, network_type)
 );
 
+-- Seed valid ticket type rules for each transport network.
+-- This table enforces that each order uses a ticket type valid for its network.
+INSERT INTO ticket_type_network_rules (
+    ticket_type,
+    network_type,
+    pricing_model,
+    seat_assignment_required,
+    advance_purchase_allowed,
+    refundable,
+    validity_text
+) VALUES
+('single', 'metro', 'stops_based', FALSE, FALSE, TRUE, 'Valid for one metro journey'),
+('day_pass', 'metro', 'fixed', FALSE, FALSE, TRUE, 'Unlimited metro travel for one calendar day'),
+('single', 'national_rail', 'stops_based_with_fare_class', TRUE, TRUE, TRUE, 'One-way national rail journey'),
+('return', 'national_rail', 'stops_based_with_fare_class', TRUE, TRUE, TRUE, 'Round-trip national rail journey')
+ON CONFLICT (ticket_type, network_type) DO NOTHING;
+
 -- fare_class_code:
 --   national rail: 'standard', 'first'
 --   metro:         'metro_single'
 CREATE TABLE schedule_fares (
     -- [PK design decision: Composite] Composite primary key combining schedule ID and fare class code.
     -- [FK cascade behaviour: ON DELETE CASCADE] When a schedule is hard deleted, the associated fare class price definitions are automatically cascaded and deleted.
-    schedule_id        TEXT NOT NULL REFERENCES service_schedules(schedule_id) ON DELETE CASCADE,
+    schedule_id        TEXT NOT NULL ,
+    network_type       TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     fare_class_code    TEXT NOT NULL CHECK (fare_class_code IN ('standard', 'first', 'metro_single')),
     base_fare_usd      NUMERIC(10,2) NOT NULL CHECK (base_fare_usd >= 0),
     per_stop_rate_usd  NUMERIC(10,2) NOT NULL CHECK (per_stop_rate_usd >= 0),
     currency_code      CHAR(3) NOT NULL DEFAULT 'USD',
-    PRIMARY KEY (schedule_id, fare_class_code)
+
+    PRIMARY KEY (schedule_id, fare_class_code),
+
+    CONSTRAINT fk_schedule_fares_schedule_network
+        FOREIGN KEY (schedule_id, network_type)
+        REFERENCES service_schedules(schedule_id, network_type)
+        ON DELETE CASCADE,
+
+    CONSTRAINT chk_schedule_fares_network_class
+        CHECK (
+            (network_type = 'metro' AND fare_class_code = 'metro_single')
+            OR
+            (network_type = 'national_rail' AND fare_class_code IN ('standard', 'first'))
+        )
 );
 
 -- ---------------------------------------------------------------------------
@@ -297,7 +381,13 @@ CREATE TABLE seat_layouts (
     layout_version TEXT NOT NULL DEFAULT '1.0',
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     -- [FK cascade behaviour: ON DELETE CASCADE] When a schedule is hard deleted, the corresponding seat layout information is automatically cascaded and deleted.
-    CONSTRAINT fk_seat_layouts_schedule_network FOREIGN KEY (schedule_id, network_type) REFERENCES service_schedules(schedule_id, network_type) ON DELETE CASCADE
+    CONSTRAINT uq_seat_layouts_layout_schedule
+        UNIQUE (layout_id, schedule_id),
+
+    CONSTRAINT fk_seat_layouts_schedule_network
+        FOREIGN KEY (schedule_id, network_type)
+        REFERENCES service_schedules(schedule_id, network_type)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE seat_layout_coaches (
@@ -308,7 +398,8 @@ CREATE TABLE seat_layout_coaches (
     coach_code       TEXT NOT NULL,
     fare_class_code  TEXT NOT NULL CHECK (fare_class_code IN ('standard', 'first')),
     UNIQUE (layout_id, coach_code),
-    UNIQUE (coach_id, layout_id)
+    UNIQUE (coach_id, layout_id),
+    UNIQUE (coach_id, fare_class_code)
 );
 
 CREATE TABLE seat_layout_seats (
@@ -322,7 +413,13 @@ CREATE TABLE seat_layout_seats (
     seat_column  TEXT NOT NULL,
     UNIQUE (layout_id, seat_code),
     UNIQUE (coach_id, seat_code),
-    CONSTRAINT uq_seat_coach UNIQUE (seat_pk, coach_id)
+    UNIQUE (seat_pk, coach_id),
+    UNIQUE (seat_pk, layout_id, coach_id),
+
+    CONSTRAINT fk_seat_layout_seats_coach_layout
+        FOREIGN KEY (coach_id, layout_id)
+        REFERENCES seat_layout_coaches(coach_id, layout_id)
+        ON DELETE CASCADE
 );
 
 -- ---------------------------------------------------------------------------
@@ -397,24 +494,33 @@ CREATE TABLE travel_orders (
     user_id           TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
     network_type      TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     -- [FK cascade behaviour: ON DELETE RESTRICT] Never hard delete a ticket type if it’s still associated with any orders."
-    product_type      TEXT NOT NULL REFERENCES ticket_types(ticket_type) ON DELETE RESTRICT,
+    product_type      TEXT NOT NULL ,
     order_status      TEXT NOT NULL CHECK (order_status IN ('confirmed', 'completed', 'cancelled', 'refunded')),
     total_amount_usd  NUMERIC(10,2) NOT NULL CHECK (total_amount_usd >= 0),
     currency_code     CHAR(3) NOT NULL DEFAULT 'USD',
-    purchased_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    purchased_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_travel_orders_id_network
+        UNIQUE (order_id, network_type),
+
+    CONSTRAINT fk_travel_orders_ticket_network
+        FOREIGN KEY (product_type, network_type)
+        REFERENCES ticket_type_network_rules(ticket_type, network_type)
+        ON DELETE RESTRICT
 );
 
 CREATE TABLE travel_journeys (
     -- [PK design decision: TEXT] Journey unique natural identifier code (such as 'BK-3J8F4A') usually used as the encoding for travel electronic vouchers (QR Codes).
     journey_id              TEXT PRIMARY KEY,
     -- [FK cascade behaviour: ON DELETE CASCADE] When an order is deleted, the journeys contained within it are automatically cascaded and deleted.
-    order_id                TEXT NOT NULL REFERENCES travel_orders(order_id) ON DELETE CASCADE,
+    order_id                TEXT NOT NULL,
     journey_sequence_no     INTEGER NOT NULL CHECK (journey_sequence_no >= 1),
     -- [FK cascade behaviour: ON DELETE RESTRICT] Never hard delete a schedule if it is still assigned to any journeys; related reservations must be canceled first.
-    schedule_id             TEXT NOT NULL REFERENCES service_schedules(schedule_id) ON DELETE RESTRICT,
+    schedule_id             TEXT NOT NULL ,
     -- [FK cascade behaviour: ON DELETE RESTRICT] Never delete a station if it’s still referenced as an origin or destination station for any journeys.
-    origin_station_id       TEXT NOT NULL REFERENCES stations(station_id) ON DELETE RESTRICT,
-    destination_station_id  TEXT NOT NULL REFERENCES stations(station_id) ON DELETE RESTRICT,
+    origin_station_id       TEXT NOT NULL ,
+    destination_station_id  TEXT NOT NULL ,
+    network_type            TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     travel_date             DATE NOT NULL,
     departure_time          TIME NULL,
     travelled_at            TIMESTAMPTZ NULL,
@@ -424,13 +530,35 @@ CREATE TABLE travel_journeys (
     -- [FK cascade behaviour: ON DELETE SET NULL] If the day pass journey this record references is deleted, the reference is set to NULL.
     day_pass_ref            TEXT NULL REFERENCES travel_journeys(journey_id) ON DELETE SET NULL,
     UNIQUE (order_id, journey_sequence_no),
-    CONSTRAINT uq_journeys_id_sched_date UNIQUE (journey_id, schedule_id, travel_date)
+    CONSTRAINT uq_journeys_id_sched_date
+        UNIQUE (journey_id, schedule_id, travel_date),
+
+    CONSTRAINT fk_journeys_order_network
+        FOREIGN KEY (order_id, network_type)
+        REFERENCES travel_orders(order_id, network_type)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_journeys_schedule_network
+        FOREIGN KEY (schedule_id, network_type)
+        REFERENCES service_schedules(schedule_id, network_type)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_journeys_origin_station_network
+        FOREIGN KEY (origin_station_id, network_type)
+        REFERENCES stations(station_id, network_type)
+        ON DELETE RESTRICT,
+
+    CONSTRAINT fk_journeys_dest_station_network
+        FOREIGN KEY (destination_station_id, network_type)
+        REFERENCES stations(station_id, network_type)
+        ON DELETE RESTRICT
 );
 
 CREATE TABLE rail_journey_reservations (
     -- [PK design decision: TEXT] Sharing a one-to-one primary key with travel_journeys.
     journey_id          TEXT PRIMARY KEY,
     schedule_id         TEXT NOT NULL,
+    layout_id           TEXT NOT NULL,
     travel_date         DATE NOT NULL,
     fare_class_code     TEXT NOT NULL CHECK (fare_class_code IN ('standard', 'first')),
     coach_id            BIGINT NOT NULL,
@@ -438,8 +566,25 @@ CREATE TABLE rail_journey_reservations (
     seat_reserved_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     reservation_status  TEXT NOT NULL CHECK (reservation_status IN ('active', 'cancelled')),
     -- [FK cascade behaviour: ON DELETE CASCADE] When the journey is deleted, the seat reservation record is automatically cascaded and deleted.
-    CONSTRAINT fk_reservation_journey_sched_date FOREIGN KEY (journey_id, schedule_id, travel_date) REFERENCES travel_journeys(journey_id, schedule_id, travel_date) ON DELETE CASCADE,
-    CONSTRAINT fk_reservation_seat_coach FOREIGN KEY (seat_pk, coach_id) REFERENCES seat_layout_seats(seat_pk, coach_id) ON DELETE CASCADE
+    CONSTRAINT fk_reservation_journey_sched_date
+        FOREIGN KEY (journey_id, schedule_id, travel_date)
+        REFERENCES travel_journeys(journey_id, schedule_id, travel_date)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_reservation_layout_schedule
+        FOREIGN KEY (layout_id, schedule_id)
+        REFERENCES seat_layouts(layout_id, schedule_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_reservation_seat_layout_coach
+        FOREIGN KEY (seat_pk, layout_id, coach_id)
+        REFERENCES seat_layout_seats(seat_pk, layout_id, coach_id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_reservation_coach_fare_class
+        FOREIGN KEY (coach_id, fare_class_code)
+        REFERENCES seat_layout_coaches(coach_id, fare_class_code)
+        ON DELETE CASCADE
 );
 
 -- Implement the unique partial index, which means that only the active seat reservations 
@@ -694,7 +839,7 @@ SELECT
     tj.departure_time,
     to_tbl.product_type AS ticket_type,
     rjr.fare_class_code AS fare_class,
-    sl.layout_id,
+    rjr.layout_id,
     slc.coach_code AS coach,
     sls.seat_code AS seat_id,
     tj.stops_travelled,
@@ -707,7 +852,6 @@ JOIN travel_orders to_tbl ON to_tbl.order_id = tj.order_id
 LEFT JOIN rail_journey_reservations rjr ON rjr.journey_id = tj.journey_id
 LEFT JOIN seat_layout_coaches slc ON slc.coach_id = rjr.coach_id
 LEFT JOIN seat_layout_seats sls ON sls.seat_pk = rjr.seat_pk
-LEFT JOIN seat_layouts sl ON sl.schedule_id = tj.schedule_id
 WHERE to_tbl.network_type = 'national_rail';
 
 -- national_rail_bookings INSTEAD OF INSERT Trigger
@@ -738,8 +882,19 @@ BEGIN
 
     -- 2. Insert into travel_journeys
     INSERT INTO travel_journeys (
-        journey_id, order_id, journey_sequence_no, schedule_id, origin_station_id, destination_station_id,
-        travel_date, departure_time, travelled_at, journey_status, stops_travelled, allocated_amount_usd
+        journey_id,
+        order_id,
+        journey_sequence_no,
+        schedule_id,
+        origin_station_id,
+        destination_station_id,
+        network_type,
+        travel_date,
+        departure_time,
+        travelled_at,
+        journey_status,
+        stops_travelled,
+        allocated_amount_usd
     ) VALUES (
         NEW.booking_id,
         v_order_id,
@@ -747,6 +902,7 @@ BEGIN
         NEW.schedule_id,
         NEW.origin_station_id,
         NEW.destination_station_id,
+        'national_rail',
         NEW.travel_date,
         NEW.departure_time,
         NEW.travelled_at,
@@ -760,27 +916,43 @@ BEGIN
     FROM seat_layout_coaches
     WHERE layout_id = NEW.layout_id AND coach_code = NEW.coach;
 
-    IF v_coach_id IS NOT NULL THEN
-        SELECT seat_pk INTO v_seat_pk
-        FROM seat_layout_seats
-        WHERE coach_id = v_coach_id AND seat_code = NEW.seat_id;
-
-        IF v_seat_pk IS NOT NULL THEN
-            -- 4. Insert into rail_journey_reservations
-            INSERT INTO rail_journey_reservations (
-                journey_id, schedule_id, travel_date, fare_class_code, coach_id, seat_pk, seat_reserved_at, reservation_status
-            ) VALUES (
-                NEW.booking_id,
-                NEW.schedule_id,
-                NEW.travel_date,
-                NEW.fare_class,
-                v_coach_id,
-                v_seat_pk,
-                COALESCE(NEW.booked_at, NOW()),
-                CASE WHEN NEW.status = 'cancelled' THEN 'cancelled'::TEXT ELSE 'active'::TEXT END
-            ) ON CONFLICT (journey_id) DO NOTHING;
-        END IF;
+    IF v_coach_id IS NULL THEN
+        RAISE EXCEPTION 'Coach not found for layout %, coach %', NEW.layout_id, NEW.coach;
     END IF;
+
+    SELECT seat_pk INTO v_seat_pk
+    FROM seat_layout_seats
+    WHERE coach_id = v_coach_id AND seat_code = NEW.seat_id;
+
+    IF v_seat_pk IS NULL THEN
+        RAISE EXCEPTION 'Seat not found for coach %, seat %', NEW.coach, NEW.seat_id;
+    END IF;
+
+    -- 4. Insert into rail_journey_reservations
+    INSERT INTO rail_journey_reservations (
+        journey_id,
+        schedule_id,
+        layout_id,
+        travel_date,
+        fare_class_code,
+        coach_id,
+        seat_pk,
+        seat_reserved_at,
+        reservation_status
+    ) VALUES (
+        NEW.booking_id,
+        NEW.schedule_id,
+        NEW.layout_id,
+        NEW.travel_date,
+        NEW.fare_class,
+        v_coach_id,
+        v_seat_pk,
+        COALESCE(NEW.booked_at, NOW()),
+        CASE WHEN NEW.status = 'cancelled'
+            THEN 'cancelled'::TEXT
+            ELSE 'active'::TEXT
+        END
+    ) ON CONFLICT (journey_id) DO NOTHING;
 
     RETURN NEW;
 END;
@@ -870,8 +1042,20 @@ BEGIN
 
     -- 2. Insert into travel_journeys
     INSERT INTO travel_journeys (
-        journey_id, order_id, journey_sequence_no, schedule_id, origin_station_id, destination_station_id,
-        travel_date, departure_time, travelled_at, journey_status, stops_travelled, allocated_amount_usd, day_pass_ref
+        journey_id,
+        order_id,
+        journey_sequence_no,
+        schedule_id,
+        origin_station_id,
+        destination_station_id,
+        network_type,
+        travel_date,
+        departure_time,
+        travelled_at,
+        journey_status,
+        stops_travelled,
+        allocated_amount_usd,
+        day_pass_ref
     ) VALUES (
         NEW.trip_id,
         v_order_id,
@@ -879,6 +1063,7 @@ BEGIN
         NEW.schedule_id,
         NEW.origin_station_id,
         NEW.destination_station_id,
+        'metro',
         NEW.travel_date,
         NULL,
         NEW.travelled_at,
@@ -886,7 +1071,8 @@ BEGIN
         NEW.stops_travelled,
         NEW.amount_usd,
         NEW.day_pass_ref
-    ) ON CONFLICT (journey_id) DO NOTHING;
+    )
+    ON CONFLICT (journey_id) DO NOTHING;
 
     RETURN NEW;
 END;
@@ -943,10 +1129,11 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_order_id TEXT;
 BEGIN
-    v_order_id := COALESCE(
-        CONCAT('ORD-', NEW.booking_id),
-        CONCAT('ORD-', NEW.metro_trip_id)
-    );
+    IF NEW.booking_id IS NULL AND NEW.metro_trip_id IS NULL THEN
+        RAISE EXCEPTION 'Either booking_id or metro_trip_id must be provided for payment %', NEW.payment_id;
+    END IF;
+
+    v_order_id := CONCAT('ORD-', COALESCE(NEW.booking_id, NEW.metro_trip_id));
 
     INSERT INTO payment_transactions (
         payment_id, order_id, payment_instrument_id, transaction_type,
@@ -1071,7 +1258,7 @@ BEGIN
         user_id, login_email, password_hash, password_algo, password_hash_params, password_changed_at
     ) VALUES (
         NEW.user_id,
-        '',
+        CONCAT(NEW.user_id, '@placeholder.local'),
         NEW.password_hash,
         COALESCE(NEW.hashing_algorithm, 'argon2id'),
         'm=65536,t=3,p=4',
