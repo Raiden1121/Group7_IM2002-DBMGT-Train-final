@@ -36,6 +36,35 @@
 
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- ===========================================================================
+-- GLOBAL DATABASE DESIGN DECISIONS (教授的設計抉擇筆記)
+-- ===========================================================================
+--
+-- 1. 主鍵設計決策 (Primary Key Choices):
+--    - 採用 TEXT 作為 PK 的資料表 (如 stations, lines, service_schedules, user_profiles, travel_orders, travel_journeys, payment_instruments, payment_transactions):
+--      * 理由: 這些實體的主鍵代表了「自然/業務鍵 (Natural Keys)」或來自外部整合系統定義的標準業務代碼（例如車站代碼 "MS01", 訂單號 "BK-A3F9D1"）。
+--      * 優勢: 提高日誌分析與 Debug 的可讀性、方便跨系統 API 對接，且能避免數值型自增序列可能產生的業務識別斷層。
+--    - 採用 BIGSERIAL / SERIAL 作為 PK 的資料表 (如 station_adjacencies, seat_layout_coaches, seat_layout_seats, auth_login_audit):
+--      * 理由: 這些表為高頻寫入、系統自動生成，且通常用於記錄純內部關聯或日誌審計。
+--      * 優勢: 使用數值代理主鍵 (Surrogate Keys) 可縮小索引空間 (Index Size)、大幅提升 Join 查詢速度與資料插入效能，且無須在應用程式端額外計算唯一 ID。
+--
+-- 2. 刪除策略設計 (Delete Strategy Decisions):
+--    - 我們採用「混合式資料生命週期管理策略」(Hybrid Delete Strategy):
+--      - 軟刪除 (Soft Delete - is_active BOOLEAN):
+--        * 應用於: 系統的核心主資料 (Master Data) 與實體，如 lines, stations, service_schedules, ticket_types, user_profiles, payment_instruments。
+--        * 理由: 即使某條線路或站點停用，其歷史訂單及行程記錄仍必須在資料庫中永久保留以供歷史對帳、退票及業務審計使用。
+--      - 硬刪除與級聯刪除 (Hard Delete - ON DELETE CASCADE / RESTRICT):
+--        * 應用於: 相依且無獨立生命週期的子表 (Child Tables)，如 station_lines, schedule_operating_days, schedule_stations, seat_layouts, user_auth_credentials, user_recovery_factors 等。
+--        * 理由: 當父表實體被刪除時，其相依屬性便毫無業務意義，此時透過 ON DELETE CASCADE 強制將其一併清理，可維護 Referential Integrity 並防範垃圾資料殘留。
+--
+-- 3. 外鍵級聯行為 (Foreign Key Cascade Behaviour):
+--    - 所有外鍵皆顯式聲明其級聯行為 (Explicitly Declared):
+--      - ON DELETE CASCADE: 用於從屬的弱實體表，如行程座位、車廂配置等，父表消失則子表連帶消失。
+--      - ON DELETE RESTRICT: 用於強實體之間的關聯表，如行程參考車站或班表。若車站已被行程所參考，則此車站禁止被刪除，防止產生懸空指針 (Dangling References)。
+--      - ON DELETE SET NULL: 用於關聯性稍弱的日誌與外部交易關聯（如付款工具被刪時，交易記錄的 instrument 欄位設為 NULL），保留交易金額以供審計。
+--
+-- ===========================================================================
+
 -- ---------------------------------------------------------------------------
 -- Drop views first because they depend on base tables
 -- ---------------------------------------------------------------------------
@@ -100,22 +129,28 @@ DROP TABLE IF EXISTS lines CASCADE;
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE lines (
+    -- [PK design decision: TEXT] 採用外部定義的標準路線代碼（如 'METRO_BLUE'），有利於日誌可讀性與系統對接。
     line_id        TEXT PRIMARY KEY,
     network_type   TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     line_name      TEXT NOT NULL,
+    -- [Delete strategy: Soft Delete] 線路停用時設為 FALSE，確保歷史票卡與乘車記錄仍可被審計。
     is_active      BOOLEAN NOT NULL DEFAULT TRUE,
     CONSTRAINT uq_lines_id_network UNIQUE (line_id, network_type)
 );
 
 CREATE TABLE stations (
+    -- [PK design decision: TEXT] 採用標準的車站自然業務編碼（如 'MS01'），易於 Debug 及路網建模。
     station_id      TEXT PRIMARY KEY,
     network_type    TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     station_name    TEXT NOT NULL,
+    -- [Delete strategy: Soft Delete] 車站停用時設為 FALSE，避免破壞現存的乘車歷史記錄。
     is_active       BOOLEAN NOT NULL DEFAULT TRUE,
     CONSTRAINT uq_stations_id_network UNIQUE (station_id, network_type)
 );
 
 CREATE TABLE station_lines (
+    -- [PK design decision: Composite] 複合主鍵，由車站與路線共同定義，天然唯一。
+    -- [FK cascade behaviour: ON DELETE CASCADE] 當對應的車站或路線被硬刪除時，其站點與線路的隸屬關係已無業務意義，故級聯刪除。
     station_id  TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
     line_id     TEXT NOT NULL REFERENCES lines(line_id) ON DELETE CASCADE,
     PRIMARY KEY (station_id, line_id)
@@ -124,6 +159,8 @@ CREATE TABLE station_lines (
 -- Cross-network transfer, e.g. MS01 <-> NR01.
 -- Same-system interchange does not need to be stored here; it is represented by station_lines.
 CREATE TABLE station_transfers (
+    -- [PK design decision: Composite] 複合主鍵，唯一識別從 A 車站轉乘到 B 車站的轉換路徑。
+    -- [FK cascade behaviour: ON DELETE CASCADE] 車站硬刪除時，相關的轉乘通道定義一併刪除。
     from_station_id   TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
     to_station_id     TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
     transfer_type     TEXT NOT NULL CHECK (
@@ -136,7 +173,9 @@ CREATE TABLE station_transfers (
 
 -- Directed adjacency: A -> B and B -> A should be inserted as separate rows.
 CREATE TABLE station_adjacencies (
+    -- [PK design decision: BIGSERIAL] 內部生成的高頻路網鄰接邊，使用自增代理主鍵以提升 Join 的效能。
     adjacency_id      BIGSERIAL PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 當所屬車站或路線硬刪除時，鄰接邊隨之級聯刪除。
     from_station_id   TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
     to_station_id     TEXT NOT NULL REFERENCES stations(station_id) ON DELETE CASCADE,
     line_id           TEXT NOT NULL REFERENCES lines(line_id) ON DELETE CASCADE,
@@ -150,6 +189,7 @@ CREATE TABLE station_adjacencies (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE service_schedules (
+    -- [PK design decision: TEXT] 採用班表/車次自然代碼（如 'NR_SCH01'），便於營運調度與客戶查詢。
     schedule_id             TEXT PRIMARY KEY,
     line_id                 TEXT NOT NULL,
     network_type            TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
@@ -160,20 +200,26 @@ CREATE TABLE service_schedules (
     first_train_time        TIME NOT NULL,
     last_train_time         TIME NOT NULL,
     frequency_min           INTEGER NOT NULL CHECK (frequency_min > 0),
+    -- [Delete strategy: Soft Delete] 班表停用時將 is_active 設為 FALSE，以利分析歷史班次績效。
     is_active               BOOLEAN NOT NULL DEFAULT TRUE,
     CONSTRAINT uq_schedules_id_network UNIQUE (schedule_id, network_type),
+    -- [FK cascade behaviour: ON DELETE CASCADE] 所屬路線硬刪除時，其下屬班表自動隨之級聯刪除。
     CONSTRAINT fk_schedules_line_network FOREIGN KEY (line_id, network_type) REFERENCES lines(line_id, network_type) ON DELETE CASCADE,
-    CONSTRAINT fk_schedules_origin_station_network FOREIGN KEY (origin_station_id, network_type) REFERENCES stations(station_id, network_type),
-    CONSTRAINT fk_schedules_dest_station_network FOREIGN KEY (destination_station_id, network_type) REFERENCES stations(station_id, network_type)
+    -- [FK cascade behaviour: ON DELETE RESTRICT] 若某個車站是某班表的起點或終點，嚴禁直接刪除該車站，確保引用的參考完整性。
+    CONSTRAINT fk_schedules_origin_station_network FOREIGN KEY (origin_station_id, network_type) REFERENCES stations(station_id, network_type) ON DELETE RESTRICT,
+    CONSTRAINT fk_schedules_dest_station_network FOREIGN KEY (destination_station_id, network_type) REFERENCES stations(station_id, network_type) ON DELETE RESTRICT
 );
 
 CREATE TABLE schedule_operating_days (
+    -- [PK design decision: Composite] 複合主鍵，包含班次 ID 與星期，精準表達其服務週期。
+    -- [FK cascade behaviour: ON DELETE CASCADE] 班表硬刪除時，關聯的營運日定義自動隨之級聯刪除。
     schedule_id   TEXT NOT NULL REFERENCES service_schedules(schedule_id) ON DELETE CASCADE,
     day_of_week   TEXT NOT NULL CHECK (day_of_week IN ('mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun')),
     PRIMARY KEY (schedule_id, day_of_week)
 );
 
 CREATE TABLE schedule_stations (
+    -- [PK design decision: Composite] 複合主鍵，由班表代碼與停靠順序序列構成。
     schedule_id                  TEXT NOT NULL,
     network_type                 TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     sequence_no                  INTEGER NOT NULL CHECK (sequence_no >= 1),
@@ -182,8 +228,10 @@ CREATE TABLE schedule_stations (
     travel_time_from_origin_min  INTEGER NOT NULL CHECK (travel_time_from_origin_min >= 0),
     PRIMARY KEY (schedule_id, sequence_no),
     UNIQUE (schedule_id, station_id),
+    -- [FK cascade behaviour: ON DELETE CASCADE] 當班表刪除時，其下的所有停靠站序定義自動級聯刪除。
     CONSTRAINT fk_schedule_stations_schedule_network FOREIGN KEY (schedule_id, network_type) REFERENCES service_schedules(schedule_id, network_type) ON DELETE CASCADE,
-    CONSTRAINT fk_schedule_stations_station_network FOREIGN KEY (station_id, network_type) REFERENCES stations(station_id, network_type)
+    -- [FK cascade behaviour: ON DELETE RESTRICT] 車站若為某路線班表中的停靠站，嚴禁直接刪除該車站，必須先修改班表。
+    CONSTRAINT fk_schedule_stations_station_network FOREIGN KEY (station_id, network_type) REFERENCES stations(station_id, network_type) ON DELETE RESTRICT
 );
 
 -- ---------------------------------------------------------------------------
@@ -191,9 +239,11 @@ CREATE TABLE schedule_stations (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE ticket_types (
+    -- [PK design decision: TEXT] 使用票種業務唯一識別代碼（如 'single', 'return'），防止在票價策略中出現歧義。
     ticket_type   TEXT PRIMARY KEY CHECK (ticket_type IN ('single', 'return', 'day_pass')),
     display_name  TEXT NOT NULL,
     description   TEXT NULL,
+    -- [Delete strategy: Soft Delete] 票種退役停售時標記為 FALSE，已售出的歷史訂單仍能追溯其票價屬性。
     is_active     BOOLEAN NOT NULL DEFAULT TRUE
 );
 
@@ -204,6 +254,8 @@ INSERT INTO ticket_types (ticket_type, display_name, description) VALUES
 ON CONFLICT (ticket_type) DO NOTHING;
 
 CREATE TABLE ticket_type_network_rules (
+    -- [PK design decision: Composite] 複合主鍵，由票種與鐵路網類型唯一決定某個規則集。
+    -- [FK cascade behaviour: ON DELETE CASCADE] 票種刪除時，其鐵路網下的衍生票價规则也一併級聯刪除。
     ticket_type                   TEXT NOT NULL REFERENCES ticket_types(ticket_type) ON DELETE CASCADE,
     network_type                  TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
     pricing_model                 TEXT NOT NULL CHECK (
@@ -224,6 +276,8 @@ CREATE TABLE ticket_type_network_rules (
 --   national rail: 'standard', 'first'
 --   metro:         'metro_single'
 CREATE TABLE schedule_fares (
+    -- [PK design decision: Composite] 複合主鍵，結合班次 ID 與艙等編碼。
+    -- [FK cascade behaviour: ON DELETE CASCADE] 班表硬刪除時，關聯的艙等票價定義一併自動級聯刪除。
     schedule_id        TEXT NOT NULL REFERENCES service_schedules(schedule_id) ON DELETE CASCADE,
     fare_class_code    TEXT NOT NULL CHECK (fare_class_code IN ('standard', 'first', 'metro_single')),
     base_fare_usd      NUMERIC(10,2) NOT NULL CHECK (base_fare_usd >= 0),
@@ -238,16 +292,20 @@ CREATE TABLE schedule_fares (
 
 --  Debugging: making sure the search will focus on 'national_rail'
 CREATE TABLE seat_layouts (
+    -- [PK design decision: TEXT] 採用座位布局物理自然代碼（如 'SL_LAYOUT_A'），對應車輛配置模型。
     layout_id      TEXT PRIMARY KEY,
     schedule_id    TEXT NOT NULL UNIQUE,
     network_type   TEXT NOT NULL DEFAULT 'national_rail' CHECK (network_type = 'national_rail'),
     layout_version TEXT NOT NULL DEFAULT '1.0',
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- [FK cascade behaviour: ON DELETE CASCADE] 班次刪除時，對應的座位物理布局資訊隨之級聯刪除。
     CONSTRAINT fk_seat_layouts_schedule_network FOREIGN KEY (schedule_id, network_type) REFERENCES service_schedules(schedule_id, network_type) ON DELETE CASCADE
 );
 
 CREATE TABLE seat_layout_coaches (
+    -- [PK design decision: BIGSERIAL] 使用自增代理鍵以在後續關聯座位時取得最佳效能。
     coach_id         BIGSERIAL PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 座位布局配置硬刪除時，其下的所有車廂配置一併級聯刪除。
     layout_id        TEXT NOT NULL REFERENCES seat_layouts(layout_id) ON DELETE CASCADE,
     coach_code       TEXT NOT NULL,
     fare_class_code  TEXT NOT NULL CHECK (fare_class_code IN ('standard', 'first')),
@@ -256,7 +314,9 @@ CREATE TABLE seat_layout_coaches (
 );
 
 CREATE TABLE seat_layout_seats (
+    -- [PK design decision: BIGSERIAL] 單一座位代理主鍵，用於實現跨日期高頻預訂與 Lock 查詢。
     seat_pk      BIGSERIAL PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 車廂或布局被硬刪除時，下屬的具體物理座位一併級聯刪除。
     layout_id    TEXT NOT NULL REFERENCES seat_layouts(layout_id) ON DELETE CASCADE,
     coach_id     BIGINT NOT NULL REFERENCES seat_layout_coaches(coach_id) ON DELETE CASCADE,
     seat_code    TEXT NOT NULL,
@@ -272,17 +332,21 @@ CREATE TABLE seat_layout_seats (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE user_profiles (
+    -- [PK design decision: TEXT] 採用固定前綴自增業務自然鍵（如 'RU100234'），方便於客服系統與使用者辨識。
     user_id        TEXT PRIMARY KEY,
     full_name      TEXT NOT NULL,
     first_name     TEXT NOT NULL,
     surname        TEXT NOT NULL,
     phone          TEXT NULL,
     date_of_birth  DATE NOT NULL,
+    -- [Delete strategy: Soft Delete] 使用者註銷時將 is_active 設為 FALSE，確保歷史出行訂單記錄仍符合會計法律保留期限。
     is_active      BOOLEAN NOT NULL DEFAULT TRUE,
     registered_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE user_auth_credentials (
+    -- [PK design decision: Shared Primary Key (TEXT)] 與 user_profiles 共享一對一主鍵，強化架構安全。
+    -- [FK cascade behaviour: ON DELETE CASCADE] 使用者基本資料被永久硬刪除時，敏感的安全憑證資料一併級聯刪除，防止隱私洩漏。
     user_id               TEXT PRIMARY KEY REFERENCES user_profiles(user_id) ON DELETE CASCADE,
     login_email           TEXT NOT NULL,
     password_hash         TEXT NOT NULL,
@@ -300,7 +364,9 @@ CREATE UNIQUE INDEX idx_user_auth_credentials_email_lower
 ON user_auth_credentials (LOWER(login_email));
 
 CREATE TABLE user_recovery_factors (
+    -- [PK design decision: TEXT] 自然恢復要素 ID（如 'RF-RU100234'）。
     recovery_factor_id  TEXT PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 用戶刪除時，其密碼找回安全問題一併級聯硬刪除。
     user_id             TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
     factor_type         TEXT NOT NULL DEFAULT 'security_question',
     question_text       TEXT NOT NULL,
@@ -310,7 +376,9 @@ CREATE TABLE user_recovery_factors (
 );
 
 CREATE TABLE auth_login_audit (
+    -- [PK design decision: BIGSERIAL] 登入安全審計記錄，自增流水號，提供高效寫入效能。
     audit_id               BIGSERIAL PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE SET NULL] 若使用者 profile 被刪除，保留此登入安全審計行並設為 NULL，維護整體日誌分析完整性。
     user_id                TEXT NULL REFERENCES user_profiles(user_id) ON DELETE SET NULL,
     login_email_attempted  TEXT NOT NULL,
     ip_hash                TEXT NULL,
@@ -324,11 +392,14 @@ CREATE TABLE auth_login_audit (
 -- ---------------------------------------------------------------------------
 
 CREATE TABLE travel_orders (
+    -- [PK design decision: TEXT] 訂單唯一自然號（如 'ORD-BK-123456'），易於發票與對帳整合。
     order_id          TEXT PRIMARY KEY,
     order_code        TEXT NOT NULL UNIQUE,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 當會員檔案被徹底硬刪除時，其訂單資料一併刪除。
     user_id           TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
     network_type      TEXT NOT NULL CHECK (network_type IN ('metro', 'national_rail')),
-    product_type      TEXT NOT NULL REFERENCES ticket_types(ticket_type),
+    -- [FK cascade behaviour: ON DELETE RESTRICT] 只要此票種還有訂單關聯，嚴禁硬刪除此票種定義。
+    product_type      TEXT NOT NULL REFERENCES ticket_types(ticket_type) ON DELETE RESTRICT,
     order_status      TEXT NOT NULL CHECK (order_status IN ('confirmed', 'completed', 'cancelled', 'refunded')),
     total_amount_usd  NUMERIC(10,2) NOT NULL CHECK (total_amount_usd >= 0),
     currency_code     CHAR(3) NOT NULL DEFAULT 'USD',
@@ -336,24 +407,30 @@ CREATE TABLE travel_orders (
 );
 
 CREATE TABLE travel_journeys (
+    -- [PK design decision: TEXT] 乘車行程自然識別碼（如 'BK-3J8F4A'），通常作為乘車電子憑證 (QR Code) 編碼。
     journey_id              TEXT PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 訂單被刪除時，其所包含的行程級聯硬刪除。
     order_id                TEXT NOT NULL REFERENCES travel_orders(order_id) ON DELETE CASCADE,
     journey_sequence_no     INTEGER NOT NULL CHECK (journey_sequence_no >= 1),
-    schedule_id             TEXT NOT NULL REFERENCES service_schedules(schedule_id),
-    origin_station_id       TEXT NOT NULL REFERENCES stations(station_id),
-    destination_station_id  TEXT NOT NULL REFERENCES stations(station_id),
+    -- [FK cascade behaviour: ON DELETE RESTRICT] 只要此班表有被行程所指派，嚴禁直接硬刪除該班表，必須先取消相關預訂。
+    schedule_id             TEXT NOT NULL REFERENCES service_schedules(schedule_id) ON DELETE RESTRICT,
+    -- [FK cascade behaviour: ON DELETE RESTRICT] 若起點或終點車站有乘車行程關聯，禁止直接刪除該車站。
+    origin_station_id       TEXT NOT NULL REFERENCES stations(station_id) ON DELETE RESTRICT,
+    destination_station_id  TEXT NOT NULL REFERENCES stations(station_id) ON DELETE RESTRICT,
     travel_date             DATE NOT NULL,
     departure_time          TIME NULL,
     travelled_at            TIMESTAMPTZ NULL,
     journey_status          TEXT NOT NULL CHECK (journey_status IN ('confirmed', 'completed', 'cancelled', 'refunded')),
     stops_travelled         INTEGER NULL CHECK (stops_travelled >= 0),
     allocated_amount_usd    NUMERIC(10,2) NOT NULL CHECK (allocated_amount_usd >= 0),
+    -- [FK cascade behaviour: ON DELETE SET NULL] 若關聯的日票主票券行程被刪除，將此子行程參考設為 NULL。
     day_pass_ref            TEXT NULL REFERENCES travel_journeys(journey_id) ON DELETE SET NULL,
     UNIQUE (order_id, journey_sequence_no),
     CONSTRAINT uq_journeys_id_sched_date UNIQUE (journey_id, schedule_id, travel_date)
 );
 
 CREATE TABLE rail_journey_reservations (
+    -- [PK design decision: TEXT] 共享 travel_journeys 的行程 ID 主鍵，一對一映射。
     journey_id          TEXT PRIMARY KEY,
     schedule_id         TEXT NOT NULL,
     travel_date         DATE NOT NULL,
@@ -362,6 +439,7 @@ CREATE TABLE rail_journey_reservations (
     seat_pk             BIGINT NOT NULL,
     seat_reserved_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     reservation_status  TEXT NOT NULL CHECK (reservation_status IN ('active', 'cancelled')),
+    -- [FK cascade behaviour: ON DELETE CASCADE] 當行程被刪除時，其座位劃位預訂記錄一併級聯硬刪除。
     CONSTRAINT fk_reservation_journey_sched_date FOREIGN KEY (journey_id, schedule_id, travel_date) REFERENCES travel_journeys(journey_id, schedule_id, travel_date) ON DELETE CASCADE,
     CONSTRAINT fk_reservation_seat_coach FOREIGN KEY (seat_pk, coach_id) REFERENCES seat_layout_seats(seat_pk, coach_id) ON DELETE CASCADE
 );
@@ -377,7 +455,9 @@ WHERE reservation_status = 'active';
 -- G. Payments
 -- ---------------------------------------------------------------------------
 CREATE TABLE payment_instruments (
+    -- [PK design decision: TEXT] 支付工具自然代碼（如 'PMI-100234-CARD'）。
     payment_instrument_id TEXT PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 使用者檔案刪除時，其所綁定的安全支付 Token 資訊一併級聯刪除。
     user_id               TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
     method_type           TEXT NOT NULL CHECK (method_type IN ('credit_card', 'debit_card', 'ewallet')),
     provider_name         TEXT NULL,
@@ -388,8 +468,11 @@ CREATE TABLE payment_instruments (
 );
 
 CREATE TABLE payment_transactions (
+    -- [PK design decision: TEXT] 金融支付交易自然水單號（如 'PM-9K4N2D'）。
     payment_id            TEXT PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 當母訂單刪除時，相關金融支付記錄一併連帶級聯硬刪除以防孤立交易記錄。
     order_id              TEXT NOT NULL REFERENCES travel_orders(order_id) ON DELETE CASCADE,
+    -- [FK cascade behaviour: ON DELETE SET NULL] 若綁定支付方式已註銷刪除，歷史交易單中該支付卡參照欄位設為 NULL，保留流水金額以符會計申報要求。
     payment_instrument_id TEXT NULL REFERENCES payment_instruments(payment_instrument_id) ON DELETE SET NULL,
     transaction_type      TEXT NOT NULL CHECK (transaction_type IN ('charge', 'refund')),
     amount_usd            NUMERIC(10,2) NOT NULL CHECK (amount_usd >= 0),
@@ -397,6 +480,7 @@ CREATE TABLE payment_transactions (
     payment_status        TEXT NOT NULL CHECK (payment_status IN ('pending', 'paid', 'failed', 'refunded')),
     gateway_reference     TEXT NULL,
     processed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- [FK cascade behaviour: ON DELETE SET NULL] 若退款交易關聯的原交易單被硬刪，保留此欄設為 NULL。
     ref_payment_id        TEXT NULL REFERENCES payment_transactions(payment_id) ON DELETE SET NULL
 );
 
@@ -405,7 +489,9 @@ CREATE TABLE payment_transactions (
 -- H. Feedback
 -- ---------------------------------------------------------------------------
 CREATE TABLE journey_feedback (
+    -- [PK design decision: TEXT] 反饋流水號。
     feedback_id    TEXT PRIMARY KEY,
+    -- [FK cascade behaviour: ON DELETE CASCADE] 乘車歷史行程或使用者檔案硬刪除時，其反饋評分內容一併級聯硬刪除。
     journey_id     TEXT NOT NULL REFERENCES travel_journeys(journey_id) ON DELETE CASCADE,
     user_id        TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
     rating         INTEGER NOT NULL CHECK (rating BETWEEN 1 AND 5),
