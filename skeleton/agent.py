@@ -642,6 +642,7 @@ Or if no tool needed: {{"tool_calls": []}}
 STATIONS: Metro=MS01-MS20, Rail=NR01-NR10
 USER: {current_user_email or "not logged in"}
 get_user_bookings: call (no params) when logged-in user asks about their bookings, tickets, or travel history.
+get_payment_info: call with booking_id when user asks payment status, payment method, paid amount, or refund status for a BK/MT reference.
 make_booking/cancel_booking: only if user is logged in.
 Route/path/journey questions: use find_route. Policy questions: use search_policy.
 Never use "" as a param value. Omit optional params if unknown.
@@ -661,6 +662,7 @@ Examples:
 "refund policy" -> {{"tool_calls": [{{"name": "search_policy", "params": {{"query": "refund policy"}}}}]}}
 "hello" -> {{"tool_calls": []}}
 "show my bookings" -> {{"tool_calls": [{{"name": "get_user_bookings", "params": {{}}}}]}}
+"payment status of BK001" -> {{"tool_calls": [{{"name": "get_payment_info", "params": {{"booking_id": "BK001"}}}}]}}
 "book me a seat NR01 to NR05 on 2025-06-01" -> {{"tool_calls": [{{"name": "check_national_rail_availability", "params": {{"origin_id": "NR01", "destination_id": "NR05", "travel_date": "2025-06-01"}}}}]}}
 
 JSON:"""
@@ -674,6 +676,7 @@ JSON:"""
                 "You are a tool router. Call the right tool based on the user message. "
                 f"Logged-in user: {current_user_email or 'none'}. "
                 "My bookings/tickets/travel history → get_user_bookings (no params). "
+                "Payment status/method/amount/refund for a BK/MT reference → get_payment_info. "
                 "Book a ticket / make a booking → check_national_rail_availability first, then make_booking. "
                 "Cancel a booking → cancel_booking. "
                 "Policy/rules/conduct/compensation/luggage/bicycle questions → search_policy. "
@@ -746,7 +749,14 @@ JSON:"""
             _tool = "check_national_rail_availability" if o.startswith("NR") else "check_metro_availability"
             _fallback(_tool, _params, "availability query")
 
-    # 3. Personal booking history — requires login
+    # 3. Payment lookup for a specific booking or metro trip — requires login
+    if not _tool_selected("get_payment_info", "booking_id"):
+        _payment_triggers = {"payment", "paid", "pay", "refund status", "payment status", "payment method"}
+        _booking_refs = re.findall(r'\b(BK[A-Z0-9-]*|MT\d{3})\b', _augmented_message, re.IGNORECASE)
+        if _booking_refs and any(kw in _lower for kw in _payment_triggers):
+            _fallback("get_payment_info", {"booking_id": _booking_refs[0].upper()}, "payment lookup query")
+
+    # 4. Personal booking history — requires login
     if current_user_email and not tool_calls:
         _personal_triggers = {"my booking", "my ticket", "my trip", "my journey", "my history",
                                "my reservation", "show booking", "view booking", "check booking",
