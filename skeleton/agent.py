@@ -44,6 +44,8 @@ from databases.relational.queries import (
     auto_select_adjacent_seats,
     query_user_profile,
     query_user_bookings,
+    # Added tool query: payment lookup for a booking or metro trip.
+    query_payment_info,
     execute_booking,
     execute_cancellation,
     query_policy_vector_search,
@@ -272,6 +274,33 @@ TOOLS = [
         },
         "required": ["station_id"],
     },
+
+    # Added tools
+    {
+        "name": "recommend_adjacent_seats",
+        "description": (
+            "Recommend adjacent national rail seats for a group on a specific service. "
+            "Use when the user asks for seats together, adjacent seats, or multiple nearby seats."
+        ),
+        "parameters": {
+            "schedule_id": {"type": "string", "description": "e.g. NR_SCH01"},
+            "travel_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "fare_class": {"type": "string", "description": "standard or first"},
+            "count": {"type": "integer", "description": "Number of adjacent seats needed"},
+        },
+        "required": ["schedule_id", "travel_date", "fare_class", "count"],
+    },
+    {
+        "name": "get_payment_info",
+        "description": (
+            "Retrieve the latest payment record for one national rail booking or metro trip. "
+            "Use when the user asks about payment status, payment amount, refund status, or whether a specific booking/trip was paid."
+        ),
+        "parameters": {
+            "booking_id": {"type": "string", "description": "Booking or trip reference e.g. BK001 or MT001"},
+        },
+        "required": ["booking_id"],
+    },
 ]
 
 TOOLS_SCHEMA = """\
@@ -281,14 +310,17 @@ get_national_rail_fare(schedule_id, fare_class, stops_travelled)
 check_metro_availability(origin_id, destination_id)
 calculate_metro_fare(schedule_id, stops_travelled)
 get_available_seats(schedule_id, travel_date, fare_class)
+recommend_adjacent_seats(schedule_id, travel_date, fare_class, count)
 make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id, ticket_type?)
 cancel_booking(booking_id)
 get_user_bookings()
+get_payment_info(booking_id)
 search_policy(query)
 find_alternative_routes(origin_id, destination_id, avoid_station_id, network?)
 get_delay_ripple(station_id, hops?)"""
 
 
+# Added tool schema entry: get_payment_info(booking_id).
 # ── Agent logic ───────────────────────────────────────────────────────────────
 
 def _execute_tool(
@@ -348,8 +380,38 @@ def _execute_tool(
                 return json.dumps({"error": "No user is currently logged in."})
             result = query_user_bookings(current_user_email)
 
+        # Added tool dispatch: payment lookup for a specific booking or metro trip.
+        elif tool_name == "get_payment_info":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to view payment information."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            result = query_payment_info(params["booking_id"], profile["user_id"])
+            if not result:
+                result = {"error": "Payment not found for this user's booking or trip."}
+
         elif tool_name == "get_available_seats":
             result = query_available_seats(**params)
+        
+        elif tool_name == "recommend_adjacent_seats":
+            available = query_available_seats(
+                schedule_id=params["schedule_id"],
+                travel_date=params["travel_date"],
+                fare_class=params["fare_class"],
+            )
+            selected = auto_select_adjacent_seats(
+                available,
+                int(params["count"]),
+            )
+            result = {
+                "schedule_id": params["schedule_id"],
+                "travel_date": params["travel_date"],
+                "fare_class": params["fare_class"],
+                "requested_count": int(params["count"]),
+                "selected_seats": selected,
+                "available_count": len(available),
+            }
 
         elif tool_name == "make_booking":
             if not current_user_email:
@@ -580,6 +642,7 @@ Or if no tool needed: {{"tool_calls": []}}
 STATIONS: Metro=MS01-MS20, Rail=NR01-NR10
 USER: {current_user_email or "not logged in"}
 get_user_bookings: call (no params) when logged-in user asks about their bookings, tickets, or travel history.
+get_payment_info: call with booking_id when user asks payment status, payment method, paid amount, or refund status for a BK/MT reference.
 make_booking/cancel_booking: only if user is logged in.
 Route/path/journey questions: use find_route. Policy questions: use search_policy.
 Never use "" as a param value. Omit optional params if unknown.
@@ -599,6 +662,7 @@ Examples:
 "refund policy" -> {{"tool_calls": [{{"name": "search_policy", "params": {{"query": "refund policy"}}}}]}}
 "hello" -> {{"tool_calls": []}}
 "show my bookings" -> {{"tool_calls": [{{"name": "get_user_bookings", "params": {{}}}}]}}
+"payment status of BK001" -> {{"tool_calls": [{{"name": "get_payment_info", "params": {{"booking_id": "BK001"}}}}]}}
 "book me a seat NR01 to NR05 on 2025-06-01" -> {{"tool_calls": [{{"name": "check_national_rail_availability", "params": {{"origin_id": "NR01", "destination_id": "NR05", "travel_date": "2025-06-01"}}}}]}}
 
 JSON:"""
@@ -612,6 +676,7 @@ JSON:"""
                 "You are a tool router. Call the right tool based on the user message. "
                 f"Logged-in user: {current_user_email or 'none'}. "
                 "My bookings/tickets/travel history → get_user_bookings (no params). "
+                "Payment status/method/amount/refund for a BK/MT reference → get_payment_info. "
                 "Book a ticket / make a booking → check_national_rail_availability first, then make_booking. "
                 "Cancel a booking → cancel_booking. "
                 "Policy/rules/conduct/compensation/luggage/bicycle questions → search_policy. "
@@ -684,7 +749,14 @@ JSON:"""
             _tool = "check_national_rail_availability" if o.startswith("NR") else "check_metro_availability"
             _fallback(_tool, _params, "availability query")
 
-    # 3. Personal booking history — requires login
+    # 3. Payment lookup for a specific booking or metro trip — requires login
+    if not _tool_selected("get_payment_info", "booking_id"):
+        _payment_triggers = {"payment", "paid", "pay", "refund status", "payment status", "payment method"}
+        _booking_refs = re.findall(r'\b(BK[A-Z0-9-]*|MT\d{3})\b', _augmented_message, re.IGNORECASE)
+        if _booking_refs and any(kw in _lower for kw in _payment_triggers):
+            _fallback("get_payment_info", {"booking_id": _booking_refs[0].upper()}, "payment lookup query")
+
+    # 4. Personal booking history — requires login
     if current_user_email and not tool_calls:
         _personal_triggers = {"my booking", "my ticket", "my trip", "my journey", "my history",
                                "my reservation", "show booking", "view booking", "check booking",

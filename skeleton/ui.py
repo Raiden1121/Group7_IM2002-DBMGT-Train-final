@@ -83,6 +83,75 @@ GOOGLE_BUTTON_CSS = """
     width: 100%;
 }
 
+.login-action-row {
+    align-items: stretch;
+}
+
+.login-action-row > * {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.login-action-row button,
+.login-action-row .google-signin-button {
+    height: 40px;
+    min-height: 40px;
+    max-height: 40px;
+    padding: 0 12px;
+    font-size: 14px;
+    line-height: 20px;
+    width: 100%;
+}
+
+.login-action-row > .block.padded.hide-container.auto-margin {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+    width: 100% !important;
+}
+
+.login-action-row .html-container {
+    align-items: stretch;
+    display: flex;
+    flex: 1 1 0;
+    height: 40px;
+    margin: 0;
+    min-height: 40px;
+    overflow: visible;
+    padding: 0;
+    width: 100%;
+}
+
+.login-action-row .html-container .prose {
+    align-items: stretch;
+    display: flex;
+    flex: 1 1 0;
+    height: 100%;
+    margin: 0;
+    max-width: none;
+    min-height: 40px;
+    padding: 0;
+    width: 100%;
+}
+
+.login-action-row .html-container .prose > * {
+    width: 100%;
+}
+
+.login-action-row .google-signin-button {
+    align-self: stretch;
+    display: flex;
+    justify-content: center;
+    margin-left: -12px;
+    margin-right: -12px;
+    width: calc(100% + 24px);
+}
+
+.login-action-row .google-signin-button__text {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: nowrap;
+}
+
 .google-signin-button:hover {
     background: #f8fafd;
     box-shadow: inset 0 0 0 9999px rgba(66, 133, 244, 0.04);
@@ -535,9 +604,10 @@ with gr.Blocks(title="TransitFlow") as demo:
         login_email_in    = gr.Textbox(label="Email", placeholder="you@example.com")
         login_password_in = gr.Textbox(label="Password", type="password")
         login_error_msg   = gr.Markdown("", visible=False)
-        gr.HTML(GOOGLE_SIGNIN_BUTTON_HTML)
-        with gr.Row():
+        # Keep all login actions aligned to make password and Google auth feel equally available.
+        with gr.Row(equal_height=True, elem_classes="login-action-row"):
             login_submit_btn = gr.Button("Login", variant="primary")
+            gr.HTML(GOOGLE_SIGNIN_BUTTON_HTML)
             forgot_link_btn  = gr.Button("Forgot password?", size="sm")
             login_cancel_btn = gr.Button("Cancel", size="sm")
 
