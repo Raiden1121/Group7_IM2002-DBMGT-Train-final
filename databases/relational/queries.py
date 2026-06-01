@@ -26,8 +26,9 @@ import json
 import random
 import string
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import psycopg2
 import psycopg2.extras
@@ -38,6 +39,7 @@ from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 
 ph = PasswordHasher()
+LOCAL_TZ = ZoneInfo("Asia/Taipei")
 
 # ── Helper functions ───────────────────────────────────────────────────────────────────
 def _connect():
@@ -147,7 +149,8 @@ def query_national_rail_availability(
                 schedule_id,
                 COUNT(*) AS booked_seats
             FROM national_rail_bookings
-            WHERE travel_date = %s
+            WHERE %s IS NOT NULL
+              AND travel_date = %s
               AND status IN ('confirmed', 'completed')
             GROUP BY schedule_id
         )
@@ -165,7 +168,7 @@ def query_national_rail_availability(
     """
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (origin_id, destination_id, travel_date))
+            cur.execute(sql, (origin_id, destination_id, travel_date, travel_date))
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
@@ -347,6 +350,7 @@ def auto_select_adjacent_seats(available_seats: list[dict], count: int) -> list[
 
 def query_user_profile(user_email: str) -> Optional[dict]:
     """Return a user's profile by email."""
+    user_email = user_email.strip().lower()
     sql = """
         SELECT
             user_id,
@@ -363,7 +367,7 @@ def query_user_profile(user_email: str) -> Optional[dict]:
     """
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (user_email.lower(),))
+            cur.execute(sql, (user_email,))
             return _to_jsonable(cur.fetchone())
 
 
@@ -461,6 +465,69 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
 
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
+
+# Resolve refund percentage from DB policy tables when available.
+def _lookup_refund_policy_percent(
+    cur,
+    service_type: str,
+    ticket_type: str,
+    hours_until_departure: float,
+) -> tuple[float | None, str | None]:
+    """
+    Return (refund_percent, policy_note) from structured refund policy tables.
+
+    The current schema keeps those tables as an optional extension, so this
+    helper safely returns (None, None) when the tables are not installed.
+    """
+    cur.execute(
+        """
+        SELECT
+            to_regclass('public.refund_policies') AS policies_table,
+            to_regclass('public.refund_policy_ticket_types') AS ticket_types_table,
+            to_regclass('public.refund_policy_windows') AS windows_table
+        """
+    )
+    tables = cur.fetchone()
+    if not tables or not all(tables.values()):
+        return None, None
+
+    cur.execute(
+        """
+        SELECT
+            rp.label AS policy_label,
+            rpw.label AS window_label,
+            rpw.refund_percent,
+            rpw.admin_fee_usd
+        FROM refund_policies rp
+        JOIN refund_policy_ticket_types rpt
+          ON rpt.policy_id = rp.policy_id
+        JOIN refund_policy_windows rpw
+          ON rpw.policy_id = rp.policy_id
+        WHERE rp.network_type = 'national_rail'
+          AND rp.is_active = TRUE
+          AND (rp.service_type = %s OR rp.service_type IS NULL)
+          AND rpt.ticket_type = %s
+          AND rpw.hours_before_departure_min <= %s
+          AND (
+              rpw.hours_before_departure_max IS NULL
+              OR %s < rpw.hours_before_departure_max
+          )
+        ORDER BY
+            rp.service_type NULLS LAST,
+            rpw.hours_before_departure_min DESC
+        LIMIT 1
+        """,
+        (service_type, ticket_type, hours_until_departure, hours_until_departure),
+    )
+    policy = cur.fetchone()
+    if not policy:
+        return None, None
+
+    note = f"{policy['policy_label']} - {policy['window_label']}"
+    if policy["admin_fee_usd"]:
+        note = f"{note}; admin fee USD {policy['admin_fee_usd']}"
+    return float(policy["refund_percent"]), note
+
 
 # Create a rail booking and record a paid charge transaction.
 def execute_booking(
@@ -719,6 +786,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                     b.user_id,
                     b.travel_date,
                     b.departure_time,
+                    b.ticket_type,
                     b.amount_usd,
                     b.status,
                     s.service_type
@@ -743,29 +811,38 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             departure_dt = datetime.combine(
                 booking["travel_date"],
                 booking["departure_time"],
-            ).replace(tzinfo=timezone.utc)
-            now = datetime.now(timezone.utc)
+                tzinfo=LOCAL_TZ,
+            )
+            now = datetime.now(LOCAL_TZ)
             hours_until_departure = (departure_dt - now).total_seconds() / 3600
 
             service_type = booking["service_type"]
-            if service_type == "normal":
-                if hours_until_departure >= 48:
-                    refund_percent = 100
-                elif hours_until_departure >= 24:
-                    refund_percent = 75
-                elif hours_until_departure >= 2:
-                    refund_percent = 50
+            refund_percent, policy_note = _lookup_refund_policy_percent(
+                cur,
+                service_type,
+                booking["ticket_type"],
+                hours_until_departure,
+            )
+
+            if refund_percent is None:
+                if service_type == "normal":
+                    if hours_until_departure >= 48:
+                        refund_percent = 100
+                    elif hours_until_departure >= 24:
+                        refund_percent = 75
+                    elif hours_until_departure >= 2:
+                        refund_percent = 50
+                    else:
+                        refund_percent = 0
+                    policy_note = "Normal service cancellation policy applied."
                 else:
-                    refund_percent = 0
-                policy_note = "Normal service cancellation policy applied."
-            else:
-                if hours_until_departure >= 48:
-                    refund_percent = 100
-                elif hours_until_departure >= 4:
-                    refund_percent = 50
-                else:
-                    refund_percent = 0
-                policy_note = "Express service cancellation policy applied."
+                    if hours_until_departure >= 48:
+                        refund_percent = 100
+                    elif hours_until_departure >= 4:
+                        refund_percent = 50
+                    else:
+                        refund_percent = 0
+                    policy_note = "Express service cancellation policy applied."
 
             refund_amount = round(float(booking["amount_usd"]) * refund_percent / 100, 2)
 
@@ -1196,7 +1273,7 @@ def get_user_secret_question(email: str) -> Optional[str]:
 
 
 def verify_secret_answer(email: str, answer: str) -> bool:
-    """Return True if the provided answer matches the stored secret answer (case-insensitive)."""
+    """Return True if the provided answer matches the stored secret answer."""
     sql = """
         SELECT c.secret_answer_hash
         FROM registered_users u
@@ -1224,12 +1301,12 @@ def update_password(email: str, new_password: str) -> bool:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                UPDATE user_credentials c
+                UPDATE user_auth_credentials c
                 SET password_hash = %s,
-                    updated_at = NOW()
-                FROM registered_users u
-                WHERE u.user_id = c.user_id
-                  AND u.email = %s
+                    password_changed_at = NOW()
+                FROM user_profiles up
+                WHERE up.user_id = c.user_id
+                  AND LOWER(c.login_email) = %s
                 """,
                 (ph.hash(new_password), email.strip().lower()),
             )
