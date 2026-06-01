@@ -44,6 +44,8 @@ from databases.relational.queries import (
     auto_select_adjacent_seats,
     query_user_profile,
     query_user_bookings,
+    # Added tool query: payment lookup for a booking or metro trip.
+    query_payment_info,
     execute_booking,
     execute_cancellation,
     query_policy_vector_search,
@@ -195,20 +197,6 @@ TOOLS = [
         "required": ["schedule_id", "travel_date", "fare_class"],
     },
     {
-        "name": "recommend_adjacent_seats",
-        "description": (
-            "Recommend adjacent national rail seats for a group on a specific service. "
-            "Use when the user asks for seats together, adjacent seats, or multiple nearby seats."
-        ),
-        "parameters": {
-            "schedule_id": {"type": "string", "description": "e.g. NR_SCH01"},
-            "travel_date": {"type": "string", "description": "YYYY-MM-DD"},
-            "fare_class": {"type": "string", "description": "standard or first"},
-            "count": {"type": "integer", "description": "Number of adjacent seats needed"},
-        },
-        "required": ["schedule_id", "travel_date", "fare_class", "count"],
-    },
-    {
         "name": "make_booking",
         "description": (
             "Create a national rail booking for the logged-in user. "
@@ -286,6 +274,33 @@ TOOLS = [
         },
         "required": ["station_id"],
     },
+
+    # Added tools
+    {
+        "name": "recommend_adjacent_seats",
+        "description": (
+            "Recommend adjacent national rail seats for a group on a specific service. "
+            "Use when the user asks for seats together, adjacent seats, or multiple nearby seats."
+        ),
+        "parameters": {
+            "schedule_id": {"type": "string", "description": "e.g. NR_SCH01"},
+            "travel_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "fare_class": {"type": "string", "description": "standard or first"},
+            "count": {"type": "integer", "description": "Number of adjacent seats needed"},
+        },
+        "required": ["schedule_id", "travel_date", "fare_class", "count"],
+    },
+    {
+        "name": "get_payment_info",
+        "description": (
+            "Retrieve the latest payment record for one national rail booking or metro trip. "
+            "Use when the user asks about payment status, payment amount, refund status, or whether a specific booking/trip was paid."
+        ),
+        "parameters": {
+            "booking_id": {"type": "string", "description": "Booking or trip reference e.g. BK001 or MT001"},
+        },
+        "required": ["booking_id"],
+    },
 ]
 
 TOOLS_SCHEMA = """\
@@ -299,11 +314,13 @@ recommend_adjacent_seats(schedule_id, travel_date, fare_class, count)
 make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id, ticket_type?)
 cancel_booking(booking_id)
 get_user_bookings()
+get_payment_info(booking_id)
 search_policy(query)
 find_alternative_routes(origin_id, destination_id, avoid_station_id, network?)
 get_delay_ripple(station_id, hops?)"""
 
 
+# Added tool schema entry: get_payment_info(booking_id).
 # ── Agent logic ───────────────────────────────────────────────────────────────
 
 def _execute_tool(
@@ -362,6 +379,10 @@ def _execute_tool(
             if not current_user_email:
                 return json.dumps({"error": "No user is currently logged in."})
             result = query_user_bookings(current_user_email)
+
+        # Added tool dispatch: payment lookup for a specific booking or metro trip.
+        elif tool_name == "get_payment_info":
+            result = query_payment_info(params["booking_id"])
 
         elif tool_name == "get_available_seats":
             result = query_available_seats(**params)

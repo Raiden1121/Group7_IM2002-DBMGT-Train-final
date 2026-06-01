@@ -22,7 +22,6 @@ are already implemented — do not modify them.
 
 from __future__ import annotations
 
-import json
 import random
 import string
 from decimal import Decimal
@@ -42,6 +41,7 @@ ph = PasswordHasher()
 LOCAL_TZ = ZoneInfo("Asia/Taipei")
 
 # ── Helper functions ───────────────────────────────────────────────────────────────────
+# Open a PostgreSQL connection for read-only query helpers.
 def _connect():
     """Return a new psycopg2 connection with autocommit enabled."""
     conn = psycopg2.connect(PG_DSN)
@@ -49,20 +49,46 @@ def _connect():
     return conn
 
 
+# Generate a candidate national rail booking ID.
 def _gen_booking_id() -> str:
     suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"BK-{suffix}"
 
 
+# Generate a candidate payment transaction ID.
 def _gen_payment_id() -> str:
     suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
     return f"PM-{suffix}"
 
 
+# Generate an unused booking ID within the current transaction.
+def _gen_unique_booking_id(cur) -> str:
+    """Generate a booking ID that is not already used by travel_journeys."""
+    booking_id = _gen_booking_id()
+    while True:
+        cur.execute("SELECT 1 FROM travel_journeys WHERE journey_id = %s", (booking_id,))
+        if not cur.fetchone():
+            return booking_id
+        booking_id = _gen_booking_id()
+
+
+# Generate an unused payment ID within the current transaction.
+def _gen_unique_payment_id(cur) -> str:
+    """Generate a payment ID that is not already used by payment_transactions."""
+    payment_id = _gen_payment_id()
+    while True:
+        cur.execute("SELECT 1 FROM payment_transactions WHERE payment_id = %s", (payment_id,))
+        if not cur.fetchone():
+            return payment_id
+        payment_id = _gen_payment_id()
+
+
+# Generate a candidate local user ID.
 def _gen_user_id() -> str:
     return f"RU{random.randint(100000, 999999)}"
 
 
+# Convert database rows into JSON-safe Python values.
 def _to_jsonable(row):
     if row is None:
         return None
@@ -79,11 +105,26 @@ def _to_jsonable(row):
     return out
 
 
+# Validate a registration birth year.
+def _validate_birth_year(year_of_birth) -> tuple[bool, int | str]:
+    """Validate and normalize a birth year used for account registration."""
+    try:
+        year = int(year_of_birth)
+    except (TypeError, ValueError):
+        return False, "Invalid year of birth."
+
+    current_year = datetime.now(LOCAL_TZ).year
+    if year < 1900 or year > current_year:
+        return False, "Invalid year of birth."
+    return True, year
+
+
 # ── Example ───────────────────────────────────────────────────────────────────
 # The block below shows the query pattern: open a cursor, run SQL, return rows.
 # Use _connect() for read-only queries; for write operations use a manual
 # connection with conn.commit() / conn.rollback() (see execute_booking below).
 
+# Return a simple database connectivity check.
 def example_query() -> dict:
     """Example: returns the name of the connected database."""
     with _connect() as conn:
@@ -97,6 +138,7 @@ def example_query() -> dict:
 
 # ── NATIONAL RAIL AVAILABILITY ────────────────────────────────────────────────
 
+# Find national rail services between two stations.
 def query_national_rail_availability(
     origin_id: str,
     destination_id: str,
@@ -172,6 +214,7 @@ def query_national_rail_availability(
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
+# Calculate a national rail fare from schedule, class, and stop count.
 def query_national_rail_fare(
     schedule_id: str,
     fare_class: str,
@@ -208,6 +251,7 @@ def query_national_rail_fare(
 
 # ── METRO SCHEDULES & FARE ────────────────────────────────────────────────────
 
+# Find metro services between two stations.
 def query_metro_schedules(origin_id: str, destination_id: str) -> list[dict]:
     """
     Return metro schedules that serve both origin and destination in the correct order.
@@ -245,6 +289,7 @@ def query_metro_schedules(origin_id: str, destination_id: str) -> list[dict]:
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
+# Calculate a metro fare from schedule and stop count.
 def query_metro_fare(schedule_id: str, stops_travelled: int) -> Optional[dict]:
     """
     Calculate the metro fare for a single-ticket journey.
@@ -274,6 +319,7 @@ def query_metro_fare(schedule_id: str, stops_travelled: int) -> Optional[dict]:
 
 # ── SEAT SELECTION ────────────────────────────────────────────────────────────
 
+# List currently available national rail seats.
 def query_available_seats(
     schedule_id: str,
     travel_date: str,
@@ -319,6 +365,7 @@ def query_available_seats(
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
+# Pick nearby seats from an available-seat list.
 def auto_select_adjacent_seats(available_seats: list[dict], count: int) -> list[str]:
     """
     Select `count` seats that are as close together as possible (same row preferred,
@@ -334,20 +381,27 @@ def auto_select_adjacent_seats(available_seats: list[dict], count: int) -> list[
         return [s["seat_id"] for s in available_seats[:count]]
 
     from collections import defaultdict
-    rows: dict[int, list[dict]] = defaultdict(list)
+    groups = defaultdict(list)
     for seat in available_seats:
-        rows[seat["row"]].append(seat)
+        groups[(seat["coach"], seat["row"])].append(seat)
 
-    for row_seats in sorted(rows.values(), key=lambda s: s[0]["row"]):
-        if len(row_seats) >= count:
-            return [s["seat_id"] for s in row_seats[:count]]
+    for group_seats in groups.values():
+        group_seats.sort(key=lambda s: str(s["column"]))
 
-    sorted_seats = sorted(available_seats, key=lambda s: (s["row"], s["column"]))
+    for _, group_seats in sorted(groups.items(), key=lambda item: (item[0][0], item[0][1])):
+        if len(group_seats) >= count:
+            return [s["seat_id"] for s in group_seats[:count]]
+
+    sorted_seats = sorted(
+        available_seats,
+        key=lambda s: (s["coach"], s["row"], str(s["column"])),
+    )
     return [s["seat_id"] for s in sorted_seats[:count]]
 
 
 # ── USER & BOOKING QUERIES ────────────────────────────────────────────────────
 
+# Fetch one user's profile by email.
 def query_user_profile(user_email: str) -> Optional[dict]:
     """Return a user's profile by email."""
     user_email = user_email.strip().lower()
@@ -371,6 +425,7 @@ def query_user_profile(user_email: str) -> Optional[dict]:
             return _to_jsonable(cur.fetchone())
 
 
+# Fetch one user's rail and metro travel history.
 def query_user_bookings(user_email: str) -> dict:
     """
     Return a user's combined booking history (national rail + metro).
@@ -442,6 +497,7 @@ def query_user_bookings(user_email: str) -> dict:
 # Look up the latest payment transaction for one rail booking or metro trip.
 def query_payment_info(booking_id: str) -> Optional[dict]:
     """Return the latest payment record for a single booking or metro trip."""
+    booking_id = booking_id.strip()
     if booking_id.startswith("MT"):
         sql = """
             SELECT payment_id, booking_id, metro_trip_id, amount_usd, method, status, paid_at
@@ -465,69 +521,6 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
 
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
-
-# Resolve refund percentage from DB policy tables when available.
-def _lookup_refund_policy_percent(
-    cur,
-    service_type: str,
-    ticket_type: str,
-    hours_until_departure: float,
-) -> tuple[float | None, str | None]:
-    """
-    Return (refund_percent, policy_note) from structured refund policy tables.
-
-    The current schema keeps those tables as an optional extension, so this
-    helper safely returns (None, None) when the tables are not installed.
-    """
-    cur.execute(
-        """
-        SELECT
-            to_regclass('public.refund_policies') AS policies_table,
-            to_regclass('public.refund_policy_ticket_types') AS ticket_types_table,
-            to_regclass('public.refund_policy_windows') AS windows_table
-        """
-    )
-    tables = cur.fetchone()
-    if not tables or not all(tables.values()):
-        return None, None
-
-    cur.execute(
-        """
-        SELECT
-            rp.label AS policy_label,
-            rpw.label AS window_label,
-            rpw.refund_percent,
-            rpw.admin_fee_usd
-        FROM refund_policies rp
-        JOIN refund_policy_ticket_types rpt
-          ON rpt.policy_id = rp.policy_id
-        JOIN refund_policy_windows rpw
-          ON rpw.policy_id = rp.policy_id
-        WHERE rp.network_type = 'national_rail'
-          AND rp.is_active = TRUE
-          AND (rp.service_type = %s OR rp.service_type IS NULL)
-          AND rpt.ticket_type = %s
-          AND rpw.hours_before_departure_min <= %s
-          AND (
-              rpw.hours_before_departure_max IS NULL
-              OR %s < rpw.hours_before_departure_max
-          )
-        ORDER BY
-            rp.service_type NULLS LAST,
-            rpw.hours_before_departure_min DESC
-        LIMIT 1
-        """,
-        (service_type, ticket_type, hours_until_departure, hours_until_departure),
-    )
-    policy = cur.fetchone()
-    if not policy:
-        return None, None
-
-    note = f"{policy['policy_label']} - {policy['window_label']}"
-    if policy["admin_fee_usd"]:
-        note = f"{note}; admin fee USD {policy['admin_fee_usd']}"
-    return float(policy["refund_percent"]), note
-
 
 # Create a rail booking and record a paid charge transaction.
 def execute_booking(
@@ -559,6 +552,18 @@ def execute_booking(
         (True, booking_dict)   on success
         (False, error_message) on failure
     """
+    user_id = user_id.strip()
+    schedule_id = schedule_id.strip()
+    origin_station_id = origin_station_id.strip()
+    destination_station_id = destination_station_id.strip()
+    travel_date = travel_date.strip()
+    seat_id = seat_id.strip()
+    if seat_id.lower() != "any":
+        seat_id = seat_id.upper()
+    fare_class = fare_class.strip().lower()
+    ticket_type = ticket_type.strip().lower()
+    payment_instrument_id = payment_instrument_id.strip() if payment_instrument_id else None
+
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
     try:
@@ -682,8 +687,8 @@ def execute_booking(
                     conn.rollback()
                     return False, "Payment instrument not found or inactive for this user."
 
-            booking_id = _gen_booking_id()
-            payment_id = _gen_payment_id()
+            booking_id = _gen_unique_booking_id(cur)
+            payment_id = _gen_unique_payment_id(cur)
 
             cur.execute(
                 """
@@ -751,6 +756,16 @@ def execute_booking(
                 "status": "confirmed",
                 "payment_status": "paid",
             }
+    except psycopg2.errors.UniqueViolation as e:
+        conn.rollback()
+        constraint_name = getattr(e.diag, "constraint_name", None)
+        if constraint_name == "uq_active_seat_reservation":
+            return False, "Selected seat was just booked by another user. Please choose another seat."
+        if constraint_name in {"travel_orders_pkey", "travel_journeys_pkey"}:
+            return False, "Generated booking ID already exists. Please try again."
+        if constraint_name == "payment_transactions_pkey":
+            return False, "Generated payment ID already exists. Please try again."
+        return False, f"Booking could not be completed because of a duplicate record: {constraint_name}."
     except Exception as e:
         conn.rollback()
         return False, str(e)
@@ -764,8 +779,8 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
     Cancel a national rail booking owned by the given user.
 
     Calculates the refund amount according to the booking's service type:
-      - Normal service: RF001 windows (100% / 75% / 50% / 0%)
-      - Express service: RF002 windows (100% / 50% / 0%)
+      - Normal service: RF001 windows (100% / 75% - $0.50 / 50% - $0.50 / 0%)
+      - Express service: RF002 windows (100% - $1.00 / 50% - $1.00 / 0%)
 
     Args:
         booking_id: e.g. "BK001"
@@ -804,9 +819,9 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             if booking["user_id"] != user_id:
                 conn.rollback()
                 return False, "Booking does not belong to this user."
-            if booking["status"] == "cancelled":
+            if booking["status"] != "confirmed":
                 conn.rollback()
-                return False, "Booking is already cancelled."
+                return False, f"Only confirmed bookings can be cancelled. Current status: {booking['status']}."
 
             departure_dt = datetime.combine(
                 booking["travel_date"],
@@ -815,36 +830,41 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             )
             now = datetime.now(LOCAL_TZ)
             hours_until_departure = (departure_dt - now).total_seconds() / 3600
+            if hours_until_departure <= 0:
+                conn.rollback()
+                return False, "This booking cannot be cancelled after departure."
 
             service_type = booking["service_type"]
-            refund_percent, policy_note = _lookup_refund_policy_percent(
-                cur,
-                service_type,
-                booking["ticket_type"],
-                hours_until_departure,
-            )
-
-            if refund_percent is None:
-                if service_type == "normal":
-                    if hours_until_departure >= 48:
-                        refund_percent = 100
-                    elif hours_until_departure >= 24:
-                        refund_percent = 75
-                    elif hours_until_departure >= 2:
-                        refund_percent = 50
-                    else:
-                        refund_percent = 0
-                    policy_note = "Normal service cancellation policy applied."
+            if service_type == "normal":
+                if hours_until_departure >= 48:
+                    refund_percent = 100
+                    admin_fee_usd = 0.0
+                elif hours_until_departure >= 24:
+                    refund_percent = 75
+                    admin_fee_usd = 0.5
+                elif hours_until_departure >= 2:
+                    refund_percent = 50
+                    admin_fee_usd = 0.5
                 else:
-                    if hours_until_departure >= 48:
-                        refund_percent = 100
-                    elif hours_until_departure >= 4:
-                        refund_percent = 50
-                    else:
-                        refund_percent = 0
-                    policy_note = "Express service cancellation policy applied."
+                    refund_percent = 0
+                    admin_fee_usd = 0.0
+                policy_note = "Normal service cancellation policy applied."
+            else:
+                if hours_until_departure >= 48:
+                    refund_percent = 100
+                    admin_fee_usd = 1.0
+                elif hours_until_departure >= 24:
+                    refund_percent = 50
+                    admin_fee_usd = 1.0
+                else:
+                    refund_percent = 0
+                    admin_fee_usd = 0.0
+                policy_note = "Express service cancellation policy applied."
 
-            refund_amount = round(float(booking["amount_usd"]) * refund_percent / 100, 2)
+            refund_amount = max(
+                0,
+                round(float(booking["amount_usd"]) * refund_percent / 100 - admin_fee_usd, 2),
+            )
 
             cur.execute(
                 """
@@ -871,7 +891,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
             )
 
             if refund_amount > 0 and original_payment:
-                refund_payment_id = _gen_payment_id()
+                refund_payment_id = _gen_unique_payment_id(cur)
                 cur.execute(
                     """
                     INSERT INTO payment_transactions (
@@ -898,6 +918,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
                 "booking_id": booking_id,
                 "status": "cancelled",
                 "refund_percent": refund_percent,
+                "admin_fee_usd": admin_fee_usd,
                 "refund_amount_usd": refund_amount,
                 "refund_payment_id": refund_payment_id,
                 "ref_payment_id": original_payment["payment_id"] if original_payment else None,
@@ -932,7 +953,28 @@ def register_user(
     first_name = first_name.strip()
     surname = surname.strip()
     full_name = f"{first_name} {surname}".strip()
-    date_of_birth = f"{int(year_of_birth):04d}-01-01"
+    secret_question = secret_question.strip()
+    secret_answer = secret_answer.strip()
+
+    ok_year, year_or_error = _validate_birth_year(year_of_birth)
+    if not ok_year:
+        return False, year_or_error
+    if not email:
+        return False, "Email cannot be empty."
+    if "@" not in email or "." not in email:
+        return False, "Invalid email format."
+    if not first_name:
+        return False, "First name cannot be empty."
+    if not surname:
+        return False, "Surname cannot be empty."
+    if not password:
+        return False, "Password cannot be empty."
+    if not secret_question:
+        return False, "Secret question cannot be empty."
+    if not secret_answer:
+        return False, "Secret answer cannot be empty."
+
+    date_of_birth = f"{year_or_error:04d}-01-01"
 
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
@@ -1040,6 +1082,7 @@ def login_user(email: str, password: str) -> Optional[dict]:
             return _to_jsonable(data)
 
 
+# Link an existing Google account or stage a new Google signup.
 def login_or_create_google_user(
     provider_user_id: str,
     email: str,
@@ -1142,6 +1185,7 @@ def login_or_create_google_user(
         conn.close()
 
 
+# Complete a pending Google signup after collecting birth year.
 def complete_google_signup(
     provider_user_id: str,
     email: str,
@@ -1161,7 +1205,11 @@ def complete_google_signup(
     parts = full_name.split(maxsplit=1)
     first_name = parts[0]
     surname = parts[1] if len(parts) > 1 else ""
-    date_of_birth = f"{int(year_of_birth):04d}-01-01"
+
+    ok_year, year_or_error = _validate_birth_year(year_of_birth)
+    if not ok_year:
+        return None
+    date_of_birth = f"{year_or_error:04d}-01-01"
 
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
@@ -1256,6 +1304,7 @@ def complete_google_signup(
         conn.close()
 
 
+# Fetch the password recovery question for an email.
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
     sql = """
@@ -1272,6 +1321,7 @@ def get_user_secret_question(email: str) -> Optional[str]:
             return row[0] if row else None
 
 
+# Verify a password recovery answer.
 def verify_secret_answer(email: str, answer: str) -> bool:
     """Return True if the provided answer matches the stored secret answer."""
     sql = """
@@ -1288,13 +1338,18 @@ def verify_secret_answer(email: str, answer: str) -> bool:
             if not row or not row[0]:
                 return False
             try:
-                return ph.verify(row[0], answer)
+                return ph.verify(row[0], answer.strip())
             except (VerifyMismatchError, VerificationError):
                 return False
 
 
+# Replace a password credential with a new Argon2 hash.
 def update_password(email: str, new_password: str) -> bool:
     """Update the password for a user. Returns True if the row was updated."""
+    new_password = new_password.strip()
+    if not new_password:
+        return False
+
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
     try:
@@ -1322,6 +1377,7 @@ def update_password(email: str, new_password: str) -> bool:
 
 # ── VECTOR / RAG QUERIES — do not modify ─────────────────────────────────────
 
+# Search policy documents by vector similarity.
 def query_policy_vector_search(embedding: list[float], top_k: int = VECTOR_TOP_K) -> list[dict]:
     """
     Find the most relevant policy documents for a given query embedding.
@@ -1351,6 +1407,7 @@ def query_policy_vector_search(embedding: list[float], top_k: int = VECTOR_TOP_K
             return [dict(row) for row in cur.fetchall()]
 
 
+# Store one embedded policy document chunk.
 def store_policy_document(
     title: str,
     category: str,
