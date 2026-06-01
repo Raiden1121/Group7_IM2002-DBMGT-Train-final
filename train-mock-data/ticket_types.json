@@ -2,7 +2,10 @@
   {
     "ticket_type": "single",
     "display_name": "Single Ticket",
-    "available_on": ["metro", "national_rail"],
+    "available_on": [
+      "metro",
+      "national_rail"
+    ],
     "description": "A one-way ticket for a single journey between an origin and destination station. Valid on the selected travel date only.",
     "metro": {
       "pricing_model": "stops_based",
@@ -19,7 +22,10 @@
     "national_rail": {
       "pricing_model": "stops_based_with_fare_class",
       "formula": "amount = base_fare_usd + (stops_travelled × per_stop_rate_usd), rates vary by fare_class and service_type",
-      "fare_classes": ["standard", "first"],
+      "fare_classes": [
+        "standard",
+        "first"
+      ],
       "seat_assignment": true,
       "validity": "Selected travel date and scheduled service only. Not valid on a different service without a change fee.",
       "advance_purchase": true,
@@ -34,12 +40,17 @@
   {
     "ticket_type": "return",
     "display_name": "Return Ticket",
-    "available_on": ["national_rail"],
+    "available_on": [
+      "national_rail"
+    ],
     "description": "A two-leg ticket covering an outbound journey and a return journey on the same route. Each leg is priced and treated independently.",
     "national_rail": {
       "pricing_model": "stops_based_per_leg",
       "formula": "total amount = outbound_fare + return_fare (each leg calculated separately using stops-based pricing for the booked fare class)",
-      "fare_classes": ["standard", "first"],
+      "fare_classes": [
+        "standard",
+        "first"
+      ],
       "seat_assignment": true,
       "outbound_validity": "Selected outbound travel date and scheduled service.",
       "return_validity": "Any scheduled service on the same route within 30 days of the outbound travel date.",
@@ -56,7 +67,9 @@
   {
     "ticket_type": "day_pass",
     "display_name": "Metro Day Pass",
-    "available_on": ["metro"],
+    "available_on": [
+      "metro"
+    ],
     "description": "Unlimited travel on all metro lines (M1, M2, M3, M4) for one full calendar day. Not valid on national rail services.",
     "metro": {
       "pricing_model": "flat_rate",
@@ -64,7 +77,12 @@
       "fare_class": null,
       "seat_assignment": false,
       "unlimited_journeys": true,
-      "valid_lines": ["M1", "M2", "M3", "M4"],
+      "valid_lines": [
+        "M1",
+        "M2",
+        "M3",
+        "M4"
+      ],
       "validity": "Calendar day of purchase from 00:00 to 23:59. Cannot be used on a different date.",
       "advance_purchase": false,
       "changes_allowed": false,
@@ -72,6 +90,53 @@
       "refundable": true,
       "refund_rule": "RF004",
       "notes": "A day pass offers better value than individual single tickets for passengers making 3 or more metro trips in a day. Tap in and out normally at each station."
+    }
+  },
+  {
+    "ticket_type": "group",
+    "display_name": "National Rail Group Ticket",
+    "available_on": [
+      "national_rail"
+    ],
+    "description": "Discounted ticket for groups of 10 or more passengers travelling together on the same national rail service.",
+    "_developer_note": "Added for Group Booking Discounts feature. Since JSON doesn't support // comments, we use '_developer_note' keys to leave documentation for our teammates.",
+    "national_rail": {
+      "pricing_model": "tiered_group_discount",
+      "formula": "total amount = (base_fare_usd + (stops_travelled × per_stop_rate_usd)) × number_of_passengers × discount_multiplier",
+      "discount_tiers": [
+        {
+          "min_passengers": 10,
+          "max_passengers": 19,
+          "discount_multiplier": 1.0,
+          "description": "10 to 19 passengers: No discount, but group is guaranteed seating together."
+        },
+        {
+          "min_passengers": 20,
+          "max_passengers": 49,
+          "discount_multiplier": 0.80,
+          "description": "20 to 49 passengers: 20% off (8折)."
+        },
+        {
+          "min_passengers": 50,
+          "max_passengers": null,
+          "discount_multiplier": 0.65,
+          "description": "50 or more passengers: 35% off (65折)."
+        }
+      ],
+      "minimum_passengers": 10,
+      "requirements": "All passengers must share the same origin station, destination station, travel date, and scheduled service.",
+      "fare_classes": [
+        "standard"
+      ],
+      "seat_assignment": true,
+      "validity": "Selected travel date and scheduled service only.",
+      "advance_purchase": true,
+      "advance_purchase_max_days": 35,
+      "changes_allowed": true,
+      "change_fee_usd_per_booking": 10.00,
+      "change_deadline": "At least 7 days before scheduled departure",
+      "refundable": true,
+      "refund_rule": "RF001 (normal service), RF002 (express service) applies to the entire group booking."
     }
   }
 ]

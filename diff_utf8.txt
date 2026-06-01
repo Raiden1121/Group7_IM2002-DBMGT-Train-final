@@ -1,0 +1,346 @@
+﻿diff --git a/databases/graph/queries.py b/databases/graph/queries.py
+index d5fe1bb..4d7b374 100644
+--- a/databases/graph/queries.py
++++ b/databases/graph/queries.py
+@@ -338,8 +338,10 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
+     # The length bound is hardcoded up to 10 (*1..10) as a safety measure for graph queries.
+     query = """
+     MATCH (start {station_id: $delayed_station_id})
++    MATCH (affected) WHERE start <> affected
+     MATCH path = shortestPath((start)-[:METRO_LINK|RAIL_LINK|INTERCHANGE_TO*1..10]-(affected))
+-    WHERE length(path) <= $hops AND start <> affected // Set fliter hops (default 2) and except the delayed station itself
++    WITH path, affected
++    WHERE length(path) <= $hops
+     RETURN affected.station_id AS station_id, 
+            affected.name AS name, 
+            length(path) AS hops_away, 
+diff --git a/skeleton/seed_vectors.py b/skeleton/seed_vectors.py
+index 1383827..e8b9619 100644
+--- a/skeleton/seed_vectors.py
++++ b/skeleton/seed_vectors.py
+@@ -72,7 +72,7 @@ def build_documents():
+ 
+     # travel_policies.json ??one document per network section
+     tp = _load("travel_policies.json")
+-    for section in ("metro", "national_rail"):
++    for section in ("metro", "national_rail", "general_policies"):
+         if section in tp:
+             docs.append({
+                 "title": f"Travel Policies ??{section.replace('_', ' ').title()}",
+diff --git a/train-mock-data/booking_rules.json b/train-mock-data/booking_rules.json
+index 092181e..4bdfb8b 100644
+--- a/train-mock-data/booking_rules.json
++++ b/train-mock-data/booking_rules.json
+@@ -43,13 +43,42 @@
+         "description": "Passengers aged 16 and over pay the full adult fare."
+       }
+     },
++    "senior_fares": {
++      "age_65_and_over": {
++        "discount_percent": 50,
++        "description": "Seniors aged 65 and over pay 50% of the applicable adult fare.",
++        "proof_of_age": "Valid government-issued ID showing date of birth is required during booking and travel."
++      }
++    },
++    "student_fares": {
++      "eligible_students": {
++        "discount_percent": 20,
++        "applicable_class": "standard",
++        "description": "Students receive a 20% discount on standard class tickets. First class tickets are not eligible for this discount.",
++        "proof_of_status": "A valid domestic student ID or International Student Identity Card (ISIC) is required."
++      }
++    },
+     "group_fares": {
+-      "minimum_group_size": 10,
+-      "discount_percent": 10,
++      "pricing_model": "tiered_group_discount",
++      "reference": "See ticket_types.json for detailed tier breakpoints (10-19 pax: 0%, 20-49 pax: 20%, 50+ pax: 35%).",
+       "applicable_class": "standard",
+-      "conditions": "Group discount applies to standard class single and return tickets only. All group members must travel on the same service. Discount is applied at the time of booking when 10 or more tickets are purchased in a single transaction.",
++      "conditions": "All group members must travel on the same service, date, and route. Discount applied automatically based on group size.",
+       "not_applicable": "Group discount does not apply to first class tickets, express services, or day passes."
+     },
++    "promotional_fares": {
++      "early_bird": {
++        "advance_days_required": 28,
++        "discount_percent": 30,
++        "conditions": "Tickets booked 28 or more days in advance automatically receive a 30% discount.",
++        "restrictions": "Strictly non-refundable and non-changeable. Not combinable with other discounts."
++      },
++      "off_peak": {
++        "time_window": "10:00 - 15:00",
++        "valid_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
++        "discount_percent": 15,
++        "conditions": "Journeys starting and ending within the off-peak time window receive a 15% discount."
++      }
++    },
+     "payment": {
+       "accepted_methods": ["credit_card", "debit_card", "ewallet"],
+       "payment_timing": "Full payment is required at the time of booking.",
+diff --git a/train-mock-data/refund_policy.json b/train-mock-data/refund_policy.json
+index d43fece..b362b88 100644
+--- a/train-mock-data/refund_policy.json
++++ b/train-mock-data/refund_policy.json
+@@ -170,5 +170,54 @@
+       }
+     ],
+     "exclusions": "Delays caused by third-party events (extreme weather, security incidents, government directives, or passenger-caused incidents) are not eligible for compensation."
++  },
++  {
++    "policy_id": "RF006",
++    "label": "Severe Weather and Force Majeure",
++    "applies_to": {
++      "network_type": "all",
++      "ticket_types": ["single", "return", "day_pass", "group"]
++    },
++    "conditions": "Service suspended or significantly disrupted due to government-issued weather warnings (e.g., typhoons, earthquakes) or natural disasters.",
++    "refund_rules": {
++      "refund_percent": 100,
++      "admin_fee_usd": 0.00,
++      "time_limit": "Claims can be made even after the scheduled departure time, up to 28 days after the travel date."
++    },
++    "notes": "Passenger safety is our priority. If you cannot reach the station safely due to severe weather, full refunds apply even if the train is still running."
++  },
++  {
++    "policy_id": "RF007",
++    "label": "Missed Connection Guarantee (Cross-Network)",
++    "applies_to": {
++      "network_type": "all",
++      "ticket_types": ["single", "return"]
++    },
++    "conditions": "Passenger misses a connecting National Rail service due to a verified delay on a preceding Metro or National Rail service operated by TransitFlow.",
++    "options": [
++      {
++        "option": "Free Rebooking",
++        "description": "Passenger will be rebooked onto the next available service to their destination at no additional charge."
++      },
++      {
++        "option": "Full Refund",
++        "description": "If the passenger chooses to abandon their journey, a 100% refund is provided for the unused connecting leg without any admin fee."
++      }
++    ]
++  },
++  {
++    "policy_id": "RF008",
++    "label": "Strikes and Major Operational Disruptions",
++    "applies_to": {
++      "network_type": "all",
++      "ticket_types": ["single", "return", "day_pass", "group"]
++    },
++    "conditions": "Services are canceled or heavily disrupted due to labor union strikes, major equipment failures, or planned engineering works.",
++    "compensation": {
++      "refund_percent": 100,
++      "alternative_transport": "100% reimbursement of all alternative transport arrangements (e.g., taxis, other train operators, or flights) required to reach the destination safely."
++    },
++    "anti_abuse_clause": "Only passengers who purchased their tickets BEFORE the strike or disruption was officially announced are eligible for this benefit. This is to prevent malicious exploitation of the compensation policy.",
++    "how_to_claim": "Submit claim with all alternative transport receipts via customer service."
+   }
+ ]
+diff --git a/train-mock-data/ticket_types.json b/train-mock-data/ticket_types.json
+index a880a90..c8472e6 100644
+--- a/train-mock-data/ticket_types.json
++++ b/train-mock-data/ticket_types.json
+@@ -2,7 +2,10 @@
+   {
+     "ticket_type": "single",
+     "display_name": "Single Ticket",
+-    "available_on": ["metro", "national_rail"],
++    "available_on": [
++      "metro",
++      "national_rail"
++    ],
+     "description": "A one-way ticket for a single journey between an origin and destination station. Valid on the selected travel date only.",
+     "metro": {
+       "pricing_model": "stops_based",
+@@ -19,7 +22,10 @@
+     "national_rail": {
+       "pricing_model": "stops_based_with_fare_class",
+       "formula": "amount = base_fare_usd + (stops_travelled ? per_stop_rate_usd), rates vary by fare_class and service_type",
+-      "fare_classes": ["standard", "first"],
++      "fare_classes": [
++        "standard",
++        "first"
++      ],
+       "seat_assignment": true,
+       "validity": "Selected travel date and scheduled service only. Not valid on a different service without a change fee.",
+       "advance_purchase": true,
+@@ -34,12 +40,17 @@
+   {
+     "ticket_type": "return",
+     "display_name": "Return Ticket",
+-    "available_on": ["national_rail"],
++    "available_on": [
++      "national_rail"
++    ],
+     "description": "A two-leg ticket covering an outbound journey and a return journey on the same route. Each leg is priced and treated independently.",
+     "national_rail": {
+       "pricing_model": "stops_based_per_leg",
+       "formula": "total amount = outbound_fare + return_fare (each leg calculated separately using stops-based pricing for the booked fare class)",
+-      "fare_classes": ["standard", "first"],
++      "fare_classes": [
++        "standard",
++        "first"
++      ],
+       "seat_assignment": true,
+       "outbound_validity": "Selected outbound travel date and scheduled service.",
+       "return_validity": "Any scheduled service on the same route within 30 days of the outbound travel date.",
+@@ -56,7 +67,9 @@
+   {
+     "ticket_type": "day_pass",
+     "display_name": "Metro Day Pass",
+-    "available_on": ["metro"],
++    "available_on": [
++      "metro"
++    ],
+     "description": "Unlimited travel on all metro lines (M1, M2, M3, M4) for one full calendar day. Not valid on national rail services.",
+     "metro": {
+       "pricing_model": "flat_rate",
+@@ -64,7 +77,12 @@
+       "fare_class": null,
+       "seat_assignment": false,
+       "unlimited_journeys": true,
+-      "valid_lines": ["M1", "M2", "M3", "M4"],
++      "valid_lines": [
++        "M1",
++        "M2",
++        "M3",
++        "M4"
++      ],
+       "validity": "Calendar day of purchase from 00:00 to 23:59. Cannot be used on a different date.",
+       "advance_purchase": false,
+       "changes_allowed": false,
+@@ -73,5 +91,52 @@
+       "refund_rule": "RF004",
+       "notes": "A day pass offers better value than individual single tickets for passengers making 3 or more metro trips in a day. Tap in and out normally at each station."
+     }
++  },
++  {
++    "ticket_type": "group",
++    "display_name": "National Rail Group Ticket",
++    "available_on": [
++      "national_rail"
++    ],
++    "description": "Discounted ticket for groups of 10 or more passengers travelling together on the same national rail service.",
++    "_developer_note": "Added for Group Booking Discounts feature. Since JSON doesn't support // comments, we use '_developer_note' keys to leave documentation for our teammates.",
++    "national_rail": {
++      "pricing_model": "tiered_group_discount",
++      "formula": "total amount = (base_fare_usd + (stops_travelled ? per_stop_rate_usd)) ? number_of_passengers ? discount_multiplier",
++      "discount_tiers": [
++        {
++          "min_passengers": 10,
++          "max_passengers": 19,
++          "discount_multiplier": 1.0,
++          "description": "10 to 19 passengers: No discount, but group is guaranteed seating together."
++        },
++        {
++          "min_passengers": 20,
++          "max_passengers": 49,
++          "discount_multiplier": 0.80,
++          "description": "20 to 49 passengers: 20% off (8??."
++        },
++        {
++          "min_passengers": 50,
++          "max_passengers": null,
++          "discount_multiplier": 0.65,
++          "description": "50 or more passengers: 35% off (65??."
++        }
++      ],
++      "minimum_passengers": 10,
++      "requirements": "All passengers must share the same origin station, destination station, travel date, and scheduled service.",
++      "fare_classes": [
++        "standard"
++      ],
++      "seat_assignment": true,
++      "validity": "Selected travel date and scheduled service only.",
++      "advance_purchase": true,
++      "advance_purchase_max_days": 35,
++      "changes_allowed": true,
++      "change_fee_usd_per_booking": 10.00,
++      "change_deadline": "At least 7 days before scheduled departure",
++      "refundable": true,
++      "refund_rule": "RF001 (normal service), RF002 (express service) applies to the entire group booking."
++    }
+   }
+-]
++]
+\ No newline at end of file
+diff --git a/train-mock-data/travel_policies.json b/train-mock-data/travel_policies.json
+index 4246bf3..6dac7b9 100644
+--- a/train-mock-data/travel_policies.json
++++ b/train-mock-data/travel_policies.json
+@@ -1,6 +1,63 @@
+ {
+   "version": "1.0",
+   "last_updated": "2024-01-01",
++  "general_policies": {
++    "_developer_note": "Policies here apply to both Metro and National Rail. We use clear, structured key names (like 'reporting_procedure') so the LLM vector search can accurately understand the context without needing traditional code comments.",
++    "accessibility": {
++      "wheelchair_access": "All stations are wheelchair accessible. Ramps are available on request from platform staff.",
++      "assisted_boarding": "Passengers requiring assistance should ideally contact customer service 24 hours before travel. A 'Turn up and go' service is also available, subject to staff availability.",
++      "carer_discount": {
++        "eligible": true,
++        "discount_percent": 50,
++        "conditions": "A registered carer or companion travelling with a passenger holding a valid disability ID is entitled to a 50% discount on single and return tickets.",
++        "proof_required": "Valid government-issued disability identification must be presented during ticket inspection."
++      },
++      "visual_and_hearing_support": {
++        "station_facilities": "All stations are equipped with tactile paving and clear audio broadcast systems.",
++        "service_animals": {
++          "permitted": true,
++          "fee_usd": 0.00,
++          "carrier_required": false,
++          "rule": "Guide dogs, hearing dogs, and registered service animals travel for free on all services and do NOT need to be kept in a pet carrier."
++        }
++      }
++    },
++    "lost_property": {
++      "reporting_procedure": "Passengers who lose items should report it immediately via the 'Lost & Found' portal in the app or contact customer service.",
++      "categorized_handling": {
++        "ordinary_items": {
++          "description": "General items like umbrellas, clothing, or books.",
++          "timeline": "Kept at the station where found for 3 days. If unclaimed, transferred to Central Station (NR01) Lost Property Office for the remainder of the 90-day holding period."
++        },
++        "high_value_and_ids": {
++          "description": "Valuables (electronics, jewelry, cash) and personal identification documents.",
++          "timeline": "Transferred immediately to Central Station (NR01) secure storage and held for 90 days."
++        },
++        "dangerous_goods": {
++          "description": "Hazardous materials, flammable items, or weapons.",
++          "timeline": "Disposed of immediately or safely neutralized for security reasons."
++        },
++        "perishables": {
++          "description": "Food and unsealed drinks.",
++          "timeline": "Disposed of at the end of the operating day for hygiene reasons."
++        }
++      },
++      "claim_verification_process": {
++        "requirements": [
++          "A valid government-issued photo ID.",
++          "Proof of travel (e.g., ticket, booking confirmation, or travel history on the app).",
++          "A highly detailed and accurate description of the item (e.g., lock screen wallpaper, specific scratches, unique contents of a bag)."
++        ],
++        "rule": "Items will only be released if the passenger can unequivocally prove ownership."
++      },
++      "collection_hours": "08:00 - 18:00, Monday to Friday (at Central Station NR01)",
++      "fees": {
++        "admin_fee_usd": 5.00,
++        "fee_rule": "A flat administration fee is charged upon reclaiming any lost item to cover handling costs."
++      },
++      "unclaimed_items_rule": "Items not claimed within 90 days will be donated to local charities, auctioned, or securely destroyed."
++    }
++  },
+   "metro": {
+     "bicycles": {
+       "foldable_bicycles": {
+@@ -120,11 +177,6 @@
+       "description": "Dedicated priority seats are available in all coaches, marked with a blue priority sign.",
+       "rule": "Priority seats are reserved for elderly passengers (65+), pregnant women, passengers with disabilities, and passengers travelling with young children. Other passengers must vacate on request."
+     },
+-    "accessibility": {
+-      "wheelchair_access": "All national rail stations are wheelchair accessible. Ramps are available on request from platform staff.",
+-      "assisted_boarding": "Passengers requiring assistance should contact customer service at least 24 hours before travel.",
+-      "priority_boarding": "Passengers with mobility difficulties are welcome to board first. Please inform platform staff."
+-    },
+     "prohibited_items": [
+       "Flammable or explosive materials",
+       "Weapons of any kind",

@@ -72,7 +72,7 @@ def build_documents():
 
     # travel_policies.json — one document per network section
     tp = _load("travel_policies.json")
-    for section in ("metro", "national_rail"):
+    for section in ("metro", "national_rail", "general_policies"):
         if section in tp:
             docs.append({
                 "title": f"Travel Policies — {section.replace('_', ' ').title()}",

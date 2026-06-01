@@ -1,6 +1,63 @@
 {
   "version": "1.0",
   "last_updated": "2024-01-01",
+  "general_policies": {
+    "_developer_note": "Policies here apply to both Metro and National Rail. We use clear, structured key names (like 'reporting_procedure') so the LLM vector search can accurately understand the context without needing traditional code comments.",
+    "accessibility": {
+      "wheelchair_access": "All stations are wheelchair accessible. Ramps are available on request from platform staff.",
+      "assisted_boarding": "Passengers requiring assistance should ideally contact customer service 24 hours before travel. A 'Turn up and go' service is also available, subject to staff availability.",
+      "carer_discount": {
+        "eligible": true,
+        "discount_percent": 50,
+        "conditions": "A registered carer or companion travelling with a passenger holding a valid disability ID is entitled to a 50% discount on single and return tickets.",
+        "proof_required": "Valid government-issued disability identification must be presented during ticket inspection."
+      },
+      "visual_and_hearing_support": {
+        "station_facilities": "All stations are equipped with tactile paving and clear audio broadcast systems.",
+        "service_animals": {
+          "permitted": true,
+          "fee_usd": 0.00,
+          "carrier_required": false,
+          "rule": "Guide dogs, hearing dogs, and registered service animals travel for free on all services and do NOT need to be kept in a pet carrier."
+        }
+      }
+    },
+    "lost_property": {
+      "reporting_procedure": "Passengers who lose items should report it immediately via the 'Lost & Found' portal in the app or contact customer service.",
+      "categorized_handling": {
+        "ordinary_items": {
+          "description": "General items like umbrellas, clothing, or books.",
+          "timeline": "Kept at the station where found for 3 days. If unclaimed, transferred to Central Station (NR01) Lost Property Office for the remainder of the 90-day holding period."
+        },
+        "high_value_and_ids": {
+          "description": "Valuables (electronics, jewelry, cash) and personal identification documents.",
+          "timeline": "Transferred immediately to Central Station (NR01) secure storage and held for 90 days."
+        },
+        "dangerous_goods": {
+          "description": "Hazardous materials, flammable items, or weapons.",
+          "timeline": "Disposed of immediately or safely neutralized for security reasons."
+        },
+        "perishables": {
+          "description": "Food and unsealed drinks.",
+          "timeline": "Disposed of at the end of the operating day for hygiene reasons."
+        }
+      },
+      "claim_verification_process": {
+        "requirements": [
+          "A valid government-issued photo ID.",
+          "Proof of travel (e.g., ticket, booking confirmation, or travel history on the app).",
+          "A highly detailed and accurate description of the item (e.g., lock screen wallpaper, specific scratches, unique contents of a bag)."
+        ],
+        "rule": "Items will only be released if the passenger can unequivocally prove ownership."
+      },
+      "collection_hours": "08:00 - 18:00, Monday to Friday (at Central Station NR01)",
+      "fees": {
+        "admin_fee_usd": 5.00,
+        "fee_rule": "A flat administration fee is charged upon reclaiming any lost item to cover handling costs."
+      },
+      "unclaimed_items_rule": "Items not claimed within 90 days will be donated to local charities, auctioned, or securely destroyed."
+    }
+  },
   "metro": {
     "bicycles": {
       "foldable_bicycles": {
@@ -119,11 +176,6 @@
     "priority_seating": {
       "description": "Dedicated priority seats are available in all coaches, marked with a blue priority sign.",
       "rule": "Priority seats are reserved for elderly passengers (65+), pregnant women, passengers with disabilities, and passengers travelling with young children. Other passengers must vacate on request."
-    },
-    "accessibility": {
-      "wheelchair_access": "All national rail stations are wheelchair accessible. Ramps are available on request from platform staff.",
-      "assisted_boarding": "Passengers requiring assistance should contact customer service at least 24 hours before travel.",
-      "priority_boarding": "Passengers with mobility difficulties are welcome to board first. Please inform platform staff."
     },
     "prohibited_items": [
       "Flammable or explosive materials",

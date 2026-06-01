@@ -43,12 +43,41 @@
         "description": "Passengers aged 16 and over pay the full adult fare."
       }
     },
+    "senior_fares": {
+      "age_65_and_over": {
+        "discount_percent": 50,
+        "description": "Seniors aged 65 and over pay 50% of the applicable adult fare.",
+        "proof_of_age": "Valid government-issued ID showing date of birth is required during booking and travel."
+      }
+    },
+    "student_fares": {
+      "eligible_students": {
+        "discount_percent": 20,
+        "applicable_class": "standard",
+        "description": "Students receive a 20% discount on standard class tickets. First class tickets are not eligible for this discount.",
+        "proof_of_status": "A valid domestic student ID or International Student Identity Card (ISIC) is required."
+      }
+    },
     "group_fares": {
-      "minimum_group_size": 10,
-      "discount_percent": 10,
+      "pricing_model": "tiered_group_discount",
+      "reference": "See ticket_types.json for detailed tier breakpoints (10-19 pax: 0%, 20-49 pax: 20%, 50+ pax: 35%).",
       "applicable_class": "standard",
-      "conditions": "Group discount applies to standard class single and return tickets only. All group members must travel on the same service. Discount is applied at the time of booking when 10 or more tickets are purchased in a single transaction.",
+      "conditions": "All group members must travel on the same service, date, and route. Discount applied automatically based on group size.",
       "not_applicable": "Group discount does not apply to first class tickets, express services, or day passes."
+    },
+    "promotional_fares": {
+      "early_bird": {
+        "advance_days_required": 28,
+        "discount_percent": 30,
+        "conditions": "Tickets booked 28 or more days in advance automatically receive a 30% discount.",
+        "restrictions": "Strictly non-refundable and non-changeable. Not combinable with other discounts."
+      },
+      "off_peak": {
+        "time_window": "10:00 - 15:00",
+        "valid_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
+        "discount_percent": 15,
+        "conditions": "Journeys starting and ending within the off-peak time window receive a 15% discount."
+      }
     },
     "payment": {
       "accepted_methods": ["credit_card", "debit_card", "ewallet"],

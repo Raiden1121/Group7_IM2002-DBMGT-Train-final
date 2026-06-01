@@ -338,8 +338,10 @@ def query_delay_ripple(delayed_station_id: str, hops: int = 2) -> list[dict]:
     # The length bound is hardcoded up to 10 (*1..10) as a safety measure for graph queries.
     query = """
     MATCH (start {station_id: $delayed_station_id})
+    MATCH (affected) WHERE start <> affected
     MATCH path = shortestPath((start)-[:METRO_LINK|RAIL_LINK|INTERCHANGE_TO*1..10]-(affected))
-    WHERE length(path) <= $hops AND start <> affected // Set fliter hops (default 2) and except the delayed station itself
+    WITH path, affected
+    WHERE length(path) <= $hops
     RETURN affected.station_id AS station_id, 
            affected.name AS name, 
            length(path) AS hops_away, 

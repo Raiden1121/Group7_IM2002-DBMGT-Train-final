@@ -170,5 +170,54 @@
       }
     ],
     "exclusions": "Delays caused by third-party events (extreme weather, security incidents, government directives, or passenger-caused incidents) are not eligible for compensation."
+  },
+  {
+    "policy_id": "RF006",
+    "label": "Severe Weather and Force Majeure",
+    "applies_to": {
+      "network_type": "all",
+      "ticket_types": ["single", "return", "day_pass", "group"]
+    },
+    "conditions": "Service suspended or significantly disrupted due to government-issued weather warnings (e.g., typhoons, earthquakes) or natural disasters.",
+    "refund_rules": {
+      "refund_percent": 100,
+      "admin_fee_usd": 0.00,
+      "time_limit": "Claims can be made even after the scheduled departure time, up to 28 days after the travel date."
+    },
+    "notes": "Passenger safety is our priority. If you cannot reach the station safely due to severe weather, full refunds apply even if the train is still running."
+  },
+  {
+    "policy_id": "RF007",
+    "label": "Missed Connection Guarantee (Cross-Network)",
+    "applies_to": {
+      "network_type": "all",
+      "ticket_types": ["single", "return"]
+    },
+    "conditions": "Passenger misses a connecting National Rail service due to a verified delay on a preceding Metro or National Rail service operated by TransitFlow.",
+    "options": [
+      {
+        "option": "Free Rebooking",
+        "description": "Passenger will be rebooked onto the next available service to their destination at no additional charge."
+      },
+      {
+        "option": "Full Refund",
+        "description": "If the passenger chooses to abandon their journey, a 100% refund is provided for the unused connecting leg without any admin fee."
+      }
+    ]
+  },
+  {
+    "policy_id": "RF008",
+    "label": "Strikes and Major Operational Disruptions",
+    "applies_to": {
+      "network_type": "all",
+      "ticket_types": ["single", "return", "day_pass", "group"]
+    },
+    "conditions": "Services are canceled or heavily disrupted due to labor union strikes, major equipment failures, or planned engineering works.",
+    "compensation": {
+      "refund_percent": 100,
+      "alternative_transport": "100% reimbursement of all alternative transport arrangements (e.g., taxis, other train operators, or flights) required to reach the destination safely."
+    },
+    "anti_abuse_clause": "Only passengers who purchased their tickets BEFORE the strike or disruption was officially announced are eligible for this benefit. This is to prevent malicious exploitation of the compensation policy.",
+    "how_to_claim": "Submit claim with all alternative transport receipts via customer service."
   }
 ]
