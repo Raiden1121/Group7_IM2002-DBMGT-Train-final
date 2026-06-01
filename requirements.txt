@@ -17,3 +17,9 @@ python-dotenv>=1.0.0         # Load .env file
 
 #hashing
 argon2-cffi
+
+# For Google OAuth
+authlib
+fastapi
+itsdangerous
+uvicorn

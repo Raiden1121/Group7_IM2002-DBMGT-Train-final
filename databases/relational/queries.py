@@ -878,6 +878,222 @@ def login_user(email: str, password: str) -> Optional[dict]:
             return _to_jsonable(data)
 
 
+def login_or_create_google_user(
+    provider_user_id: str,
+    email: str,
+    email_verified: bool,
+    display_name: str | None,
+    avatar_url: str | None,
+) -> Optional[dict]:
+    """
+    Login an existing Google OAuth user or link Google to an existing email account.
+
+    New Google-only users are not created here because user_profiles.date_of_birth
+    is required. The UI stores the Google profile in session and asks for birth year
+    before calling complete_google_signup().
+    """
+    email = email.strip().lower()
+    full_name = (display_name or email.split("@")[0]).strip()
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. Existing Google account
+            cur.execute(
+                """
+                SELECT u.*
+                FROM user_oauth_accounts oauth
+                JOIN registered_users u
+                  ON u.user_id = oauth.user_id
+                WHERE oauth.provider = 'google'
+                  AND oauth.provider_user_id = %s
+                """,
+                (provider_user_id,),
+            )
+            user = cur.fetchone()
+            if user:
+                if not user["is_active"]:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    """
+                    UPDATE user_oauth_accounts
+                    SET last_login_at = NOW(),
+                        email = %s,
+                        email_verified = %s,
+                        display_name = %s,
+                        avatar_url = %s
+                    WHERE provider = 'google'
+                      AND provider_user_id = %s
+                    """,
+                    (email, email_verified, full_name, avatar_url, provider_user_id),
+                )
+                conn.commit()
+                return _to_jsonable(user)
+
+            # 2. Existing local account with same email
+            cur.execute(
+                "SELECT * FROM registered_users WHERE email = %s",
+                (email,),
+            )
+            user = cur.fetchone()
+            if not user:
+                conn.rollback()
+                return {
+                    "needs_birth_year": True,
+                    "provider": "google",
+                    "provider_user_id": provider_user_id,
+                    "email": email,
+                    "email_verified": email_verified,
+                    "display_name": full_name,
+                    "avatar_url": avatar_url,
+                }
+            if not user["is_active"]:
+                conn.rollback()
+                return None
+            user_id = user["user_id"]
+
+            # 3. Link Google account to the existing local user.
+            cur.execute(
+                """
+                INSERT INTO user_oauth_accounts (
+                    provider, provider_user_id, user_id, email,
+                    email_verified, display_name, avatar_url,
+                    created_at, last_login_at
+                )
+                VALUES ('google', %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (provider, provider_user_id) DO UPDATE
+                SET last_login_at = NOW()
+                """,
+                (provider_user_id, user_id, email, email_verified, full_name, avatar_url),
+            )
+
+            cur.execute("SELECT * FROM registered_users WHERE user_id = %s", (user_id,))
+            user = cur.fetchone()
+            conn.commit()
+            return _to_jsonable(user)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def complete_google_signup(
+    provider_user_id: str,
+    email: str,
+    email_verified: bool,
+    display_name: str | None,
+    avatar_url: str | None,
+    year_of_birth: int,
+) -> Optional[dict]:
+    """
+    Create a local TransitFlow user after Google OAuth and required birth year.
+
+    If the Google account or email was linked while the user was completing the
+    form, the existing active account is returned instead of creating a duplicate.
+    """
+    email = email.strip().lower()
+    full_name = (display_name or email.split("@")[0]).strip()
+    parts = full_name.split(maxsplit=1)
+    first_name = parts[0]
+    surname = parts[1] if len(parts) > 1 else ""
+    date_of_birth = f"{int(year_of_birth):04d}-01-01"
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. Re-check whether the Google account was created in another tab.
+            cur.execute(
+                """
+                SELECT u.*
+                FROM user_oauth_accounts oauth
+                JOIN registered_users u
+                  ON u.user_id = oauth.user_id
+                WHERE oauth.provider = 'google'
+                  AND oauth.provider_user_id = %s
+                """,
+                (provider_user_id,),
+            )
+            user = cur.fetchone()
+            if user:
+                if not user["is_active"]:
+                    conn.rollback()
+                    return None
+                cur.execute(
+                    """
+                    UPDATE user_oauth_accounts
+                    SET last_login_at = NOW()
+                    WHERE provider = 'google'
+                      AND provider_user_id = %s
+                    """,
+                    (provider_user_id,),
+                )
+                conn.commit()
+                return _to_jsonable(user)
+
+            # 2. Reuse an existing local account with the same email when present.
+            cur.execute(
+                "SELECT * FROM registered_users WHERE email = %s",
+                (email,),
+            )
+            user = cur.fetchone()
+            if user:
+                if not user["is_active"]:
+                    conn.rollback()
+                    return None
+                user_id = user["user_id"]
+            else:
+                user_id = _gen_user_id()
+                while True:
+                    cur.execute("SELECT 1 FROM user_profiles WHERE user_id = %s", (user_id,))
+                    if not cur.fetchone():
+                        break
+                    user_id = _gen_user_id()
+
+                cur.execute(
+                    """
+                    INSERT INTO user_profiles (
+                        user_id, full_name, first_name, surname,
+                        phone, date_of_birth, is_active, registered_at
+                    )
+                    VALUES (%s, %s, %s, %s, NULL, %s, TRUE, NOW())
+                    """,
+                    (user_id, full_name, first_name, surname, date_of_birth),
+                )
+
+            # 3. Store the Google account mapping after the local user exists.
+            cur.execute(
+                """
+                INSERT INTO user_oauth_accounts (
+                    provider, provider_user_id, user_id, email,
+                    email_verified, display_name, avatar_url,
+                    created_at, last_login_at
+                )
+                VALUES ('google', %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                ON CONFLICT (provider, provider_user_id) DO UPDATE
+                SET last_login_at = NOW(),
+                    email = EXCLUDED.email,
+                    email_verified = EXCLUDED.email_verified,
+                    display_name = EXCLUDED.display_name,
+                    avatar_url = EXCLUDED.avatar_url
+                """,
+                (provider_user_id, user_id, email, email_verified, full_name, avatar_url),
+            )
+
+            cur.execute("SELECT * FROM registered_users WHERE user_id = %s", (user_id,))
+            user = cur.fetchone()
+            conn.commit()
+            return _to_jsonable(user)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_user_secret_question(email: str) -> Optional[str]:
     """Return the secret question for a registered email, or None if not found."""
     sql = """
