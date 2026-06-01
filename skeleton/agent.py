@@ -195,6 +195,20 @@ TOOLS = [
         "required": ["schedule_id", "travel_date", "fare_class"],
     },
     {
+        "name": "recommend_adjacent_seats",
+        "description": (
+            "Recommend adjacent national rail seats for a group on a specific service. "
+            "Use when the user asks for seats together, adjacent seats, or multiple nearby seats."
+        ),
+        "parameters": {
+            "schedule_id": {"type": "string", "description": "e.g. NR_SCH01"},
+            "travel_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "fare_class": {"type": "string", "description": "standard or first"},
+            "count": {"type": "integer", "description": "Number of adjacent seats needed"},
+        },
+        "required": ["schedule_id", "travel_date", "fare_class", "count"],
+    },
+    {
         "name": "make_booking",
         "description": (
             "Create a national rail booking for the logged-in user. "
@@ -281,6 +295,7 @@ get_national_rail_fare(schedule_id, fare_class, stops_travelled)
 check_metro_availability(origin_id, destination_id)
 calculate_metro_fare(schedule_id, stops_travelled)
 get_available_seats(schedule_id, travel_date, fare_class)
+recommend_adjacent_seats(schedule_id, travel_date, fare_class, count)
 make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id, ticket_type?)
 cancel_booking(booking_id)
 get_user_bookings()
@@ -350,6 +365,25 @@ def _execute_tool(
 
         elif tool_name == "get_available_seats":
             result = query_available_seats(**params)
+        
+        elif tool_name == "recommend_adjacent_seats":
+            available = query_available_seats(
+                schedule_id=params["schedule_id"],
+                travel_date=params["travel_date"],
+                fare_class=params["fare_class"],
+            )
+            selected = auto_select_adjacent_seats(
+                available,
+                int(params["count"]),
+            )
+            result = {
+                "schedule_id": params["schedule_id"],
+                "travel_date": params["travel_date"],
+                "fare_class": params["fare_class"],
+                "requested_count": int(params["count"]),
+                "selected_seats": selected,
+                "available_count": len(available),
+            }
 
         elif tool_name == "make_booking":
             if not current_user_email:

@@ -39,7 +39,7 @@ from skeleton.config import PG_DSN, VECTOR_TOP_K, VECTOR_SIMILARITY_THRESHOLD
 
 ph = PasswordHasher()
 
-
+# ── Helper functions ───────────────────────────────────────────────────────────────────
 def _connect():
     """Return a new psycopg2 connection with autocommit enabled."""
     conn = psycopg2.connect(PG_DSN)
@@ -435,8 +435,9 @@ def query_user_bookings(user_email: str) -> dict:
             return {"national_rail": rail_rows, "metro": metro_rows}
 
 
+# Look up the latest payment transaction for one rail booking or metro trip.
 def query_payment_info(booking_id: str) -> Optional[dict]:
-    """Return payment record for a booking or metro trip."""
+    """Return the latest payment record for a single booking or metro trip."""
     if booking_id.startswith("MT"):
         sql = """
             SELECT payment_id, booking_id, metro_trip_id, amount_usd, method, status, paid_at
@@ -461,6 +462,7 @@ def query_payment_info(booking_id: str) -> Optional[dict]:
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
 
+# Create a rail booking and record a paid charge transaction.
 def execute_booking(
     user_id: str,
     schedule_id: str,
@@ -470,9 +472,10 @@ def execute_booking(
     fare_class: str,
     seat_id: str,
     ticket_type: str = "single",
+    payment_instrument_id: str | None = None,
 ) -> tuple[bool, dict | str]:
     """
-    Create a national rail booking for a logged-in user.
+    Create a national rail booking for a logged-in user and record payment.
 
     Args:
         user_id:                e.g. "RU01" — must match the logged-in user
@@ -483,6 +486,7 @@ def execute_booking(
         fare_class:             "standard" or "first"
         seat_id:                e.g. "B05" (or "any" to auto-assign)
         ticket_type:            "single" (default) or "return"
+        payment_instrument_id:  optional saved payment method owned by the user
 
     Returns:
         (True, booking_dict)   on success
@@ -596,6 +600,21 @@ def execute_booking(
                 conn.rollback()
                 return False, "Fare information not found."
 
+            if payment_instrument_id:
+                cur.execute(
+                    """
+                    SELECT payment_instrument_id
+                    FROM payment_instruments
+                    WHERE payment_instrument_id = %s
+                      AND user_id = %s
+                      AND is_active = TRUE
+                    """,
+                    (payment_instrument_id, user_id),
+                )
+                if not cur.fetchone():
+                    conn.rollback()
+                    return False, "Payment instrument not found or inactive for this user."
+
             booking_id = _gen_booking_id()
             payment_id = _gen_payment_id()
 
@@ -628,17 +647,27 @@ def execute_booking(
             )
             cur.execute(
                 """
-                INSERT INTO payments (
-                    payment_id, booking_id, metro_trip_id, amount_usd, method, status, paid_at
+                INSERT INTO payment_transactions (
+                    payment_id, order_id, payment_instrument_id, transaction_type,
+                    amount_usd, currency_code, payment_status, gateway_reference, processed_at
                 )
-                VALUES (%s, %s, NULL, %s, %s, %s, NOW())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NOW())
                 """,
-                (payment_id, booking_id, fare["total_fare_usd"], "card", "paid"),
+                (
+                    payment_id,
+                    f"ORD-{booking_id}",
+                    payment_instrument_id,
+                    "charge",
+                    fare["total_fare_usd"],
+                    "USD",
+                    "paid",
+                ),
             )
             conn.commit()
             return True, {
                 "booking_id": booking_id,
                 "payment_id": payment_id,
+                "payment_instrument_id": payment_instrument_id,
                 "user_id": user_id,
                 "schedule_id": schedule_id,
                 "origin_station_id": origin_station_id,
@@ -662,6 +691,7 @@ def execute_booking(
         conn.close()
 
 
+# Cancel a rail booking and record the matching refund transaction when applicable.
 def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | str]:
     """
     Cancel a national rail booking owned by the given user.
@@ -741,18 +771,59 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
 
             cur.execute(
                 """
+                SELECT payment_id, payment_instrument_id
+                FROM payment_transactions
+                WHERE order_id = %s
+                  AND transaction_type = 'charge'
+                  AND payment_status = 'paid'
+                ORDER BY processed_at DESC
+                LIMIT 1
+                """,
+                (f"ORD-{booking_id}",),
+            )
+            original_payment = cur.fetchone()
+            refund_payment_id = None
+
+            cur.execute(
+                """
                 UPDATE national_rail_bookings
                 SET status = 'cancelled'
                 WHERE booking_id = %s
                 """,
                 (booking_id,),
             )
+
+            if refund_amount > 0 and original_payment:
+                refund_payment_id = _gen_payment_id()
+                cur.execute(
+                    """
+                    INSERT INTO payment_transactions (
+                        payment_id, order_id, payment_instrument_id, transaction_type,
+                        amount_usd, currency_code, payment_status, gateway_reference,
+                        processed_at, ref_payment_id
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NOW(), %s)
+                    """,
+                    (
+                        refund_payment_id,
+                        f"ORD-{booking_id}",
+                        original_payment["payment_instrument_id"],
+                        "refund",
+                        refund_amount,
+                        "USD",
+                        "refunded",
+                        original_payment["payment_id"],
+                    ),
+                )
+
             conn.commit()
             return True, {
                 "booking_id": booking_id,
                 "status": "cancelled",
                 "refund_percent": refund_percent,
                 "refund_amount_usd": refund_amount,
+                "refund_payment_id": refund_payment_id,
+                "ref_payment_id": original_payment["payment_id"] if original_payment else None,
                 "policy_note": policy_note,
             }
     except Exception as e:
@@ -764,6 +835,7 @@ def execute_cancellation(booking_id: str, user_id: str) -> tuple[bool, dict | st
 
 # ── AUTHENTICATION QUERIES ────────────────────────────────────────────────────
 
+# Register a password user with Argon2-hashed credentials and recovery answer.
 def register_user(
     email: str,
     first_name: str,
@@ -777,8 +849,7 @@ def register_user(
     Register a new user.
     Returns (True, user_id) on success or (False, error_message) on failure.
 
-    NOTE: passwords are stored as plain text here intentionally for teaching
-    purposes. In production, replace with a salted hash (e.g. bcrypt).
+    NOTE: passwords and recovery answers are stored as Argon2 hashes.
     """
     email = email.strip().lower()
     first_name = first_name.strip()
@@ -842,11 +913,13 @@ def register_user(
         conn.close()
 
 
+# Verify a password login and write an audit result for the attempt.
 def login_user(email: str, password: str) -> Optional[dict]:
     """
     Verify credentials. Returns a user dict on success or None on failure.
     Dict keys: user_id, email, full_name, first_name, surname, phone, date_of_birth, is_active.
     """
+    email = email.strip().lower()
     sql = """
         SELECT
             u.user_id,
@@ -863,16 +936,28 @@ def login_user(email: str, password: str) -> Optional[dict]:
           ON c.user_id = u.user_id
         WHERE u.email = %s
     """
+    audit_sql = """
+        INSERT INTO auth_login_audit (
+            user_id, login_email_attempted, ip_hash, user_agent_hash, result, occurred_at
+        )
+        VALUES (%s, %s, NULL, NULL, %s, NOW())
+    """
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (email.strip().lower(),))
+            cur.execute(sql, (email,))
             row = cur.fetchone()
-            if not row or not row["is_active"]:
+            if not row:
+                cur.execute(audit_sql, (None, email, "failed"))
+                return None
+            if not row["is_active"]:
+                cur.execute(audit_sql, (row["user_id"], email, "locked"))
                 return None
             try:
                 ph.verify(row["password_hash"], password)
             except (VerifyMismatchError, VerificationError):
+                cur.execute(audit_sql, (row["user_id"], email, "failed"))
                 return None
+            cur.execute(audit_sql, (row["user_id"], email, "success"))
             data = dict(row)
             data.pop("password_hash", None)
             return _to_jsonable(data)
