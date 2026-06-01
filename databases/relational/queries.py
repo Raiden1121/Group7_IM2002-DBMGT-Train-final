@@ -495,28 +495,31 @@ def query_user_bookings(user_email: str) -> dict:
 
 
 # Look up the latest payment transaction for one rail booking or metro trip.
-def query_payment_info(booking_id: str) -> Optional[dict]:
+def query_payment_info(booking_id: str, user_id: str | None = None) -> Optional[dict]:
     """Return the latest payment record for a single booking or metro trip."""
     booking_id = booking_id.strip()
-    if booking_id.startswith("MT"):
-        sql = """
-            SELECT payment_id, booking_id, metro_trip_id, amount_usd, method, status, paid_at
-            FROM payments
-            WHERE metro_trip_id = %s
-            ORDER BY paid_at DESC NULLS LAST
-            LIMIT 1
-        """
-    else:
-        sql = """
-            SELECT payment_id, booking_id, metro_trip_id, amount_usd, method, status, paid_at
-            FROM payments
-            WHERE booking_id = %s
-            ORDER BY paid_at DESC NULLS LAST
-            LIMIT 1
-        """
+    sql = """
+        SELECT
+            pt.payment_id,
+            CASE WHEN to_tbl.network_type = 'national_rail' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS booking_id,
+            CASE WHEN to_tbl.network_type = 'metro' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS metro_trip_id,
+            pt.amount_usd,
+            COALESCE(pi.method_type, 'credit_card') AS method,
+            pt.payment_status AS status,
+            pt.processed_at AS paid_at
+        FROM payment_transactions pt
+        JOIN travel_orders to_tbl
+          ON to_tbl.order_id = pt.order_id
+        LEFT JOIN payment_instruments pi
+          ON pi.payment_instrument_id = pt.payment_instrument_id
+        WHERE pt.order_id = %s
+          AND (%s IS NULL OR to_tbl.user_id = %s)
+        ORDER BY pt.processed_at DESC NULLS LAST
+        LIMIT 1
+    """
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (booking_id,))
+            cur.execute(sql, (f"ORD-{booking_id}", user_id, user_id))
             return _to_jsonable(cur.fetchone())
 
 

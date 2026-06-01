@@ -1154,6 +1154,9 @@ CREATE OR REPLACE FUNCTION trg_payments_insert_func()
 RETURNS TRIGGER AS $$
 DECLARE
     v_order_id TEXT;
+    v_user_id TEXT;
+    v_method_type TEXT;
+    v_payment_instrument_id TEXT;
 BEGIN
     IF NEW.booking_id IS NULL AND NEW.metro_trip_id IS NULL THEN
         RAISE EXCEPTION 'Either booking_id or metro_trip_id must be provided for payment %', NEW.payment_id;
@@ -1161,13 +1164,40 @@ BEGIN
 
     v_order_id := CONCAT('ORD-', COALESCE(NEW.booking_id, NEW.metro_trip_id));
 
+    SELECT user_id
+    INTO v_user_id
+    FROM travel_orders
+    WHERE order_id = v_order_id;
+
+    IF v_user_id IS NULL THEN
+        RAISE EXCEPTION 'No travel order found for payment % and order %', NEW.payment_id, v_order_id;
+    END IF;
+
+    v_method_type := COALESCE(NULLIF(NEW.method, ''), 'credit_card');
+    v_payment_instrument_id := CONCAT('PMI-', v_user_id, '-', v_method_type);
+
+    -- Store the mock payment method as a reusable seeded instrument for the user.
+    INSERT INTO payment_instruments (
+        payment_instrument_id, user_id, method_type, provider_name,
+        token_ref, last4, is_active, created_at
+    ) VALUES (
+        v_payment_instrument_id,
+        v_user_id,
+        v_method_type,
+        'mock',
+        CONCAT('mock-token-', v_user_id, '-', v_method_type),
+        CASE WHEN v_method_type IN ('credit_card', 'debit_card') THEN '0000' ELSE NULL END,
+        TRUE,
+        NOW()
+    ) ON CONFLICT (payment_instrument_id) DO NOTHING;
+
     INSERT INTO payment_transactions (
         payment_id, order_id, payment_instrument_id, transaction_type,
         amount_usd, currency_code, payment_status, gateway_reference, processed_at
     ) VALUES (
         NEW.payment_id,
         v_order_id,
-        NULL,
+        v_payment_instrument_id,
         CASE WHEN NEW.status = 'refunded' THEN 'refund'::TEXT ELSE 'charge'::TEXT END,
         NEW.amount_usd,
         'USD',
@@ -1175,6 +1205,7 @@ BEGIN
         NULL,
         COALESCE(NEW.paid_at, NOW())
     ) ON CONFLICT (payment_id) DO UPDATE SET
+        payment_instrument_id = EXCLUDED.payment_instrument_id,
         payment_status = EXCLUDED.payment_status,
         processed_at = EXCLUDED.processed_at;
 

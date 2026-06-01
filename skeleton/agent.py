@@ -382,7 +382,14 @@ def _execute_tool(
 
         # Added tool dispatch: payment lookup for a specific booking or metro trip.
         elif tool_name == "get_payment_info":
-            result = query_payment_info(params["booking_id"])
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to view payment information."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            result = query_payment_info(params["booking_id"], profile["user_id"])
+            if not result:
+                result = {"error": "Payment not found for this user's booking or trip."}
 
         elif tool_name == "get_available_seats":
             result = query_available_seats(**params)
