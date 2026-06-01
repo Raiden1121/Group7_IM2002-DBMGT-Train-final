@@ -43,3 +43,13 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "transitflow")
 # ── RAG settings ──────────────────────────────────────────────────────────────
 VECTOR_TOP_K           = int(os.getenv("VECTOR_TOP_K", "3"))       # How many policy chunks to retrieve
 VECTOR_SIMILARITY_THRESHOLD = float(os.getenv("VECTOR_SIMILARITY_THRESHOLD", "0.5"))
+
+# ── Google OAuth ──────────────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+SESSION_SECRET_KEY = os.getenv("SESSION_SECRET_KEY", "")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:7860")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    f"{APP_BASE_URL}/auth/google/callback",
+)

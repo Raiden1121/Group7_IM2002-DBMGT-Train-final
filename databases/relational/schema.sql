@@ -105,6 +105,7 @@ DROP TABLE IF EXISTS auth_login_audit CASCADE;
 DROP TABLE IF EXISTS user_recovery_factors CASCADE;
 DROP TABLE IF EXISTS user_auth_credentials CASCADE;
 DROP TABLE IF EXISTS user_profiles CASCADE;
+DROP TABLE IF EXISTS user_oauth_accounts CASCADE;
 
 DROP TABLE IF EXISTS seat_layout_seats CASCADE;
 DROP TABLE IF EXISTS seat_layout_coaches CASCADE;
@@ -482,6 +483,27 @@ CREATE TABLE auth_login_audit (
     occurred_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE user_oauth_accounts (
+    -- Google OAuth account mapped to a local TransitFlow user.
+    provider          TEXT NOT NULL,
+    provider_user_id  TEXT NOT NULL,
+    user_id           TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+    email             TEXT NOT NULL,
+    email_verified    BOOLEAN NOT NULL DEFAULT FALSE,
+    display_name      TEXT NULL,
+    avatar_url        TEXT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_login_at     TIMESTAMPTZ NULL,
+    PRIMARY KEY (provider, provider_user_id),
+    UNIQUE (provider, user_id)
+);
+
+CREATE INDEX idx_user_oauth_accounts_user_id
+ON user_oauth_accounts (user_id);
+
+CREATE INDEX idx_user_oauth_accounts_email_lower
+ON user_oauth_accounts (LOWER(email));
+
 -- ---------------------------------------------------------------------------
 -- F. Booking / travel history
 -- ---------------------------------------------------------------------------
@@ -797,7 +819,7 @@ JOIN seat_layout_coaches slc
 CREATE OR REPLACE VIEW registered_users AS
 SELECT
     up.user_id,
-    uac.login_email AS email,
+    COALESCE(uac.login_email, oauth.email) AS email,
     up.first_name,
     up.surname,
     up.full_name,
@@ -806,7 +828,11 @@ SELECT
     up.registered_at,
     up.is_active
 FROM user_profiles up
-LEFT JOIN user_auth_credentials uac ON uac.user_id = up.user_id;
+LEFT JOIN user_auth_credentials uac
+  ON uac.user_id = up.user_id
+LEFT JOIN user_oauth_accounts oauth
+  ON oauth.user_id = up.user_id
+ AND oauth.provider = 'google';
 
 CREATE OR REPLACE VIEW user_credentials AS
 SELECT
