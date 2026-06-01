@@ -1,8 +1,0 @@
-feat: add comprehensive fare rules, refund policies, and group ticket options
-
-- Graph DB: Refactored Cypher query in `query_delay_ripple` for better structure.
-- Vector Seeding: Updated `seed_vectors.py` to index the new `general_policies`.
-- Booking Rules: Added senior, student, and promotional fares (early bird, off-peak). Updated group fares to a tiered pricing model.
-- Refund Policy: Introduced new policies for severe weather (RF006), missed connections (RF007), and major disruptions (RF008).
-- Ticket Types: Added National Rail Group Ticket with tiered discount pricing and formatted JSON lists.
-- Travel Policies: Extracted accessibility policies into a new `general_policies` section and added detailed lost property procedures.
