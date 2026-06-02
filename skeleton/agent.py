@@ -275,8 +275,8 @@ TOOLS = [
         "name": "get_delay_ripple",
         "description": "Show which stations and lines are affected by a disruption or delay at a given station (within N hops).",
         "parameters": {
-            "station_id": {"type": "string", "description": "Station ID e.g. NR03 or MS07"},
-            "hops":       {"type": "integer", "description": "How many connections out to check (default 2)"},
+            "station_id": {"type": "string", "description": "The disrupted station ID from the user message, e.g. NR01 for Central Station or NR03 for Old Town Junction"},
+            "hops":       {"type": "integer", "description": "How many connections out to check, e.g. 3 for a 3-hop radius (default 2)"},
         },
         "required": ["station_id"],
     },
@@ -592,7 +592,7 @@ def _execute_tool(
                 {
                     "title":      d["title"],
                     "category":   d["category"],
-                    "content":    d["content"][:800],
+                    "content":    d["content"],
                     "similarity": round(d["similarity"], 3),
                 }
                 for d in docs
@@ -766,7 +766,8 @@ def run_agent(
         contextual_prompt = SYSTEM_PROMPT + (
             "\n\nNo user is currently logged in. "
             "If the user asks about personal bookings, history, or wants to make/cancel a booking, "
-            "tell them they must log in first."
+            "tell them they must log in first. Do not mention login for routes, fares, schedules, "
+            "policies, graph analysis, or other public database results."
         )
 
     # Step 1: Ask the LLM which tools to call
@@ -812,6 +813,7 @@ Examples:
 "show my bookings" -> {{"tool_calls": [{{"name": "get_user_bookings", "params": {{}}}}]}}
 "payment status of BK001" -> {{"tool_calls": [{{"name": "get_payment_info", "params": {{"booking_id": "BK001"}}}}]}}
 "book me a seat NR01 to NR05 on 2025-06-01" -> {{"tool_calls": [{{"name": "check_national_rail_availability", "params": {{"origin_id": "NR01", "destination_id": "NR05", "travel_date": "2025-06-01"}}}}]}}
+"delay ripple from Central Station (NR01) within a 3-hop radius" -> {{"tool_calls": [{{"name": "get_delay_ripple", "params": {{"station_id": "NR01", "hops": 3}}}}]}}
 
 JSON:"""
 
@@ -836,6 +838,7 @@ JSON:"""
                 "Cancel a booking → cancel_booking. "
                 "Policy/rules/conduct/compensation/luggage/bicycle questions → search_policy. "
                 "Route/directions/fastest/quickest/how-to-get/path questions → find_route ONLY (never get_metro_fare). "
+                "Delay ripple/disruption/system failure/affected-station questions → get_delay_ripple with station_id and hops if stated. "
                 "Metro fare/price/cost/how-much-does-it-cost questions → get_metro_fare. "
                 "Rail fare/cost/price questions → check_national_rail_availability then get_national_rail_fare. "
                 "Schedule/timetable/trains/services questions → check_national_rail_availability or check_metro_availability. "
@@ -859,6 +862,11 @@ JSON:"""
     # correct tool is not already selected with valid required params.
     _lower = _augmented_message.lower()
     _station_ids = re.findall(r'\b(MS\d{2}|NR\d{2})\b', _augmented_message, re.IGNORECASE)
+    _station_ids_unique = []
+    for _sid in _station_ids:
+        _sid = _sid.upper()
+        if _sid not in _station_ids_unique:
+            _station_ids_unique.append(_sid)
     _two_stations = len(_station_ids) >= 2
     _date_match = re.search(r'\b\d{4}-\d{2}-\d{2}\b', _augmented_message)
     _travel_date = _date_match.group(0) if _date_match else None
@@ -876,6 +884,30 @@ JSON:"""
         tool_calls = [{"name": name, "params": params}]
         if debug:
             debug_info.append(f"**Fallback:** {reason} → {name}({params})")
+
+    _hop_match = re.search(
+        r'\b(?:within\s+)?(\d+)\s*[- ]?\s*hops?\b|\b(\d+)\s*[- ]?\s*hop\s+radius\b',
+        _lower,
+    )
+    _requested_hops = int(next(g for g in _hop_match.groups() if g)) if _hop_match else None
+    _delay_triggers = {
+        "delay", "delayed", "disruption", "disrupted", "failure", "system failure",
+        "ripple", "affected", "affected stations", "stations will be affected",
+    }
+    if any(kw in _lower for kw in _delay_triggers) and _station_ids_unique:
+        _params = {"station_id": _station_ids_unique[0]}
+        if _requested_hops is not None:
+            _params["hops"] = _requested_hops
+        if (
+            not _tool_selected("get_delay_ripple", "station_id")
+            or next((c for c in tool_calls if c.get("name") == "get_delay_ripple"), {}).get("params", {}).get("station_id", "").upper()
+               not in _station_ids_unique
+            or (
+                _requested_hops is not None
+                and next((c for c in tool_calls if c.get("name") == "get_delay_ripple"), {}).get("params", {}).get("hops") != _requested_hops
+            )
+        ):
+            _fallback("get_delay_ripple", _params, "delay ripple query")
 
     # 1. Route / directions / path — also overrides wrong-tool selections
     _route_triggers = {"fastest route", "quickest route", "shortest route", "cheapest route",
@@ -1051,7 +1083,10 @@ JSON:"""
         content = (
             f"DATA FROM TRANSITFLOW DATABASE:\n{data_block}"
             f"\n\nUser asks: {user_message}"
-            f"\n\nAnswer using only the data above:"
+            "\n\nAnswer using only the data above. If records are present, do not say no data "
+            "was found. Include every returned record that answers the user's question, "
+            "preserving important fields such as station_id, name, hops_away, lines_affected, "
+            "route legs, fares, dates, and statuses:"
         )
     elif any(kw in user_message.lower() for kw in _DB_KEYWORDS):
         # No tool was called but the question needs DB data — prevent hallucination.
@@ -1067,6 +1102,22 @@ JSON:"""
     final_messages = history + [{"role": "user", "content": content}]
 
     answer = llm.chat(messages=final_messages, system_prompt=contextual_prompt)
+
+    if tool_results:
+        required_station_ids = []
+        for tr in tool_results:
+            try:
+                parsed = json.loads(tr["result"])
+            except Exception:
+                continue
+            if isinstance(parsed, list) and len(parsed) <= 20:
+                for row in parsed:
+                    if isinstance(row, dict) and row.get("station_id"):
+                        sid = str(row["station_id"]).upper()
+                        if sid not in required_station_ids:
+                            required_station_ids.append(sid)
+        if required_station_ids and any(sid not in answer.upper() for sid in required_station_ids):
+            answer = data_block
 
     # Update history
     updated_history = history + [
