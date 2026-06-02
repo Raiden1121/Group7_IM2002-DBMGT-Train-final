@@ -488,6 +488,7 @@ def query_user_bookings(user_email: str) -> dict:
             b.stops_travelled,
             b.amount_usd,
             b.status,
+            pay.payment_status,
             b.booked_at,
             b.travelled_at,
             orig.name AS origin_name,
@@ -497,6 +498,14 @@ def query_user_bookings(user_email: str) -> dict:
           ON orig.station_id = b.origin_station_id
         JOIN national_rail_stations dest
           ON dest.station_id = b.destination_station_id
+        LEFT JOIN LATERAL (
+            SELECT pt.payment_status
+            FROM payment_transactions pt
+            WHERE pt.order_id = CONCAT('ORD-', b.booking_id)
+              AND pt.transaction_type = 'charge'
+            ORDER BY pt.processed_at DESC NULLS LAST
+            LIMIT 1
+        ) pay ON TRUE
         WHERE b.user_id = %s
         ORDER BY b.travel_date DESC, b.booked_at DESC NULLS LAST
     """
@@ -510,6 +519,7 @@ def query_user_bookings(user_email: str) -> dict:
             m.stops_travelled,
             m.amount_usd,
             m.status,
+            pay.payment_status,
             m.purchased_at,
             m.travelled_at,
             orig.name AS origin_name,
@@ -519,6 +529,14 @@ def query_user_bookings(user_email: str) -> dict:
           ON orig.station_id = m.origin_station_id
         JOIN metro_stations dest
           ON dest.station_id = m.destination_station_id
+        LEFT JOIN LATERAL (
+            SELECT pt.payment_status
+            FROM payment_transactions pt
+            WHERE pt.order_id = CONCAT('ORD-', m.trip_id)
+              AND pt.transaction_type = 'charge'
+            ORDER BY pt.processed_at DESC NULLS LAST
+            LIMIT 1
+        ) pay ON TRUE
         WHERE m.user_id = %s
         ORDER BY m.travel_date DESC, m.purchased_at DESC NULLS LAST
     """
@@ -535,6 +553,8 @@ def query_user_bookings(user_email: str) -> dict:
 def query_payment_info(booking_id: str, user_id: str | None = None) -> Optional[dict]:
     """Return the latest payment record for a single booking or metro trip."""
     booking_id = booking_id.strip().upper()
+    if booking_id.startswith("ORD-"):
+        booking_id = booking_id[4:]
     sql = """
         SELECT
             pt.payment_id,
@@ -561,6 +581,272 @@ def query_payment_info(booking_id: str, user_id: str | None = None) -> Optional[
 
 
 # ── ADDED USER ACCOUNT / METRO / FEEDBACK QUERIES ────────────────────────────
+
+# Release expired pending orders and their reservations.
+def cleanup_expired_pending_orders(user_id: str | None = None) -> int:
+    """Cancel pending orders whose 10-minute payment window has expired."""
+    user_id = user_id.strip() if user_id else None
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT to_tbl.order_id
+                FROM travel_orders to_tbl
+                JOIN payment_transactions pt
+                  ON pt.order_id = to_tbl.order_id
+                WHERE pt.transaction_type = 'charge'
+                  AND pt.payment_status = 'pending'
+                  AND pt.processed_at + INTERVAL '10 minutes' <= NOW()
+                  AND (%s IS NULL OR to_tbl.user_id = %s)
+                """,
+                (user_id, user_id),
+            )
+            expired_orders = sorted({row["order_id"] for row in cur.fetchall()})
+
+            for order_id in expired_orders:
+                _release_pending_order(cur, order_id)
+
+            conn.commit()
+            return len(expired_orders)
+    except Exception:
+        conn.rollback()
+        return 0
+    finally:
+        conn.close()
+
+
+# Release one pending order using existing view triggers where possible.
+def _release_pending_order(cur, order_id: str) -> None:
+    """Mark a pending order as cancelled/failed and release any active seat hold."""
+    cur.execute(
+        """
+        SELECT
+            to_tbl.order_id,
+            to_tbl.user_id,
+            to_tbl.network_type,
+            tj.journey_id,
+            tj.schedule_id,
+            tj.travel_date,
+            rjr.seat_pk
+        FROM travel_orders to_tbl
+        JOIN travel_journeys tj
+          ON tj.order_id = to_tbl.order_id
+        LEFT JOIN rail_journey_reservations rjr
+          ON rjr.journey_id = tj.journey_id
+        WHERE to_tbl.order_id = %s
+        LIMIT 1
+        """,
+        (order_id,),
+    )
+    order = cur.fetchone()
+    if not order:
+        return
+
+    if order["network_type"] == "national_rail":
+        cur.execute(
+            """
+            UPDATE national_rail_bookings
+            SET status = 'cancelled'
+            WHERE booking_id = %s
+            """,
+            (order["journey_id"],),
+        )
+        if order["seat_pk"] is not None:
+            cur.execute(
+                """
+                UPDATE seat_locks
+                SET status = 'released'
+                WHERE user_id = %s
+                  AND schedule_id = %s
+                  AND travel_date = %s
+                  AND seat_pk = %s
+                  AND status IN ('pending', 'confirmed')
+                """,
+                (
+                    order["user_id"],
+                    order["schedule_id"],
+                    order["travel_date"],
+                    order["seat_pk"],
+                ),
+            )
+    else:
+        cur.execute(
+            """
+            UPDATE metro_travel_history
+            SET status = 'cancelled'
+            WHERE trip_id = %s
+            """,
+            (order["journey_id"],),
+        )
+
+    cur.execute(
+        """
+        UPDATE payment_transactions
+        SET payment_status = 'failed',
+            processed_at = NOW()
+        WHERE order_id = %s
+          AND transaction_type = 'charge'
+          AND payment_status = 'pending'
+        """,
+        (order_id,),
+    )
+
+
+# Fetch pending payment orders for one user.
+def query_pending_orders(user_id: str) -> list[dict]:
+    """Return pending orders that still need payment confirmation."""
+    user_id = user_id.strip()
+    cleanup_expired_pending_orders(user_id)
+
+    sql = """
+        SELECT
+            to_tbl.order_id,
+            tj.journey_id,
+            to_tbl.network_type,
+            origin.station_name AS origin_name,
+            dest.station_name AS destination_name,
+            tj.travel_date,
+            pt.payment_id,
+            pt.amount_usd,
+            pt.payment_status,
+            pt.processed_at,
+            pt.processed_at + INTERVAL '10 minutes' AS expires_at,
+            GREATEST(
+                0,
+                FLOOR(EXTRACT(EPOCH FROM (pt.processed_at + INTERVAL '10 minutes' - NOW())))
+            )::INTEGER AS remaining_seconds
+        FROM travel_orders to_tbl
+        JOIN travel_journeys tj
+          ON tj.order_id = to_tbl.order_id
+        JOIN payment_transactions pt
+          ON pt.order_id = to_tbl.order_id
+        JOIN stations origin
+          ON origin.station_id = tj.origin_station_id
+         AND origin.network_type = tj.network_type
+        JOIN stations dest
+          ON dest.station_id = tj.destination_station_id
+         AND dest.network_type = tj.network_type
+        WHERE to_tbl.user_id = %s
+          AND pt.transaction_type = 'charge'
+          AND pt.payment_status = 'pending'
+          AND pt.processed_at + INTERVAL '10 minutes' > NOW()
+          AND to_tbl.order_status IN ('confirmed', 'completed')
+          AND tj.journey_status IN ('confirmed', 'completed')
+        ORDER BY pt.processed_at DESC
+    """
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (user_id,))
+            return [_to_jsonable(row) for row in cur.fetchall()]
+
+
+# Confirm payment for one pending order owned by the user.
+def confirm_pending_payment(user_id: str, order_id: str) -> tuple[bool, dict | str]:
+    """Mark one pending order payment as paid before the hold expires."""
+    user_id = user_id.strip()
+    order_id = order_id.strip().upper()
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    to_tbl.order_id,
+                    pt.payment_id,
+                    pt.amount_usd,
+                    pt.processed_at + INTERVAL '10 minutes' AS expires_at
+                FROM travel_orders to_tbl
+                JOIN payment_transactions pt
+                  ON pt.order_id = to_tbl.order_id
+                WHERE to_tbl.order_id = %s
+                  AND to_tbl.user_id = %s
+                  AND pt.transaction_type = 'charge'
+                  AND pt.payment_status = 'pending'
+                ORDER BY pt.processed_at DESC
+                LIMIT 1
+                FOR UPDATE OF pt
+                """,
+                (order_id, user_id),
+            )
+            payment = cur.fetchone()
+            if not payment:
+                conn.rollback()
+                return False, "Pending order not found."
+            if payment["expires_at"] <= datetime.now(payment["expires_at"].tzinfo):
+                _release_pending_order(cur, order_id)
+                conn.commit()
+                return False, "Payment window expired. The booking has been released."
+
+            cur.execute(
+                """
+                UPDATE payment_transactions
+                SET payment_status = 'paid',
+                    processed_at = NOW()
+                WHERE payment_id = %s
+                """,
+                (payment["payment_id"],),
+            )
+            conn.commit()
+            return True, {
+                "order_id": order_id,
+                "payment_id": payment["payment_id"],
+                "amount_usd": payment["amount_usd"],
+                "payment_status": "paid",
+            }
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+# Cancel one pending order owned by the user.
+def cancel_pending_order(user_id: str, order_id: str) -> tuple[bool, dict | str]:
+    """Cancel one pending order and release its booking or trip."""
+    user_id = user_id.strip()
+    order_id = order_id.strip().upper()
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT to_tbl.order_id
+                FROM travel_orders to_tbl
+                JOIN payment_transactions pt
+                  ON pt.order_id = to_tbl.order_id
+                WHERE to_tbl.order_id = %s
+                  AND to_tbl.user_id = %s
+                  AND pt.transaction_type = 'charge'
+                  AND pt.payment_status = 'pending'
+                LIMIT 1
+                FOR UPDATE OF to_tbl
+                """,
+                (order_id, user_id),
+            )
+            if not cur.fetchone():
+                conn.rollback()
+                return False, "Pending order not found."
+
+            _release_pending_order(cur, order_id)
+            conn.commit()
+            return True, {
+                "order_id": order_id,
+                "status": "cancelled",
+                "payment_status": "failed",
+            }
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
 
 # Fetch active payment methods owned by one user without exposing token data.
 def query_user_payment_methods(user_id: str) -> list[dict]:

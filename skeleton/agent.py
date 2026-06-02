@@ -976,6 +976,14 @@ JSON:"""
     _two_stations = len(_station_ids_unique) >= 2
     _date_match = re.search(r'\b\d{4}-\d{2}-\d{2}\b', _augmented_message)
     _travel_date = _date_match.group(0) if _date_match else None
+    _explicit_booking_refs = [
+        ref.upper().removeprefix("ORD-")
+        for ref in re.findall(
+            r'\b((?:ORD-)?(?:BK-[A-Z0-9]+|BK\d{3}|MT-[A-Z0-9]+|MT\d{3}))\b',
+            _augmented_message,
+            re.IGNORECASE,
+        )
+    ]
 
     def _tool_selected(name: str, *required_params) -> bool:
         """Return True only if tool `name` is in tool_calls with all required params set."""
@@ -1143,9 +1151,8 @@ JSON:"""
     # 3. Payment lookup for a specific booking or metro trip — requires login
     if not _tool_selected("get_payment_info", "booking_id"):
         _payment_triggers = {"payment", "paid", "pay", "refund status", "payment status", "payment method"}
-        _booking_refs = re.findall(r'\b(BK[A-Z0-9-]*|MT\d{3})\b', _augmented_message, re.IGNORECASE)
-        if _booking_refs and any(kw in _lower for kw in _payment_triggers):
-            _fallback("get_payment_info", {"booking_id": _booking_refs[0].upper()}, "payment lookup query")
+        if _explicit_booking_refs and any(kw in _lower for kw in _payment_triggers):
+            _fallback("get_payment_info", {"booking_id": _explicit_booking_refs[0]}, "payment lookup query")
 
     # 4. Personal booking history — requires login
     if current_user_email and not tool_calls:
@@ -1191,6 +1198,11 @@ JSON:"""
                 params["seat_id"] = "any"
             if params.get("ticket_type") == "return" and not any(kw in _lower for kw in ["return", "round-trip", "round trip"]):
                 params["ticket_type"] = "single"
+
+        if tool_name == "get_payment_info" and _explicit_booking_refs:
+            requested_ref = _explicit_booking_refs[0]
+            if str(params.get("booking_id", "")).upper().removeprefix("ORD-") != requested_ref:
+                params["booking_id"] = requested_ref
 
         if tool_name in {"make_booking", "make_booking_by_route", "buy_metro_ticket"} and params.get("payment_instrument_id"):
             _payment_id_text = str(params["payment_instrument_id"]).upper()

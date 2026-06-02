@@ -29,7 +29,10 @@ from skeleton.config import (
     SESSION_SECRET_KEY,
 )
 from databases.relational.queries import (
+    cancel_pending_order,
+    confirm_pending_payment,
     complete_google_signup,
+    query_pending_orders,
     login_or_create_google_user,
     login_user,
     query_user_profile,
@@ -199,6 +202,13 @@ GOOGLE_BUTTON_CSS = """
 .user-info-badge strong {
     font-weight: 700;
 }
+
+.pending-orders-panel {
+    background: #ffffff;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    padding: 12px;
+}
 """
 
 GOOGLE_SIGNIN_BUTTON_HTML = """
@@ -252,6 +262,112 @@ def chat(user_message: str, history_display: list, agent_history: list,
 
 def clear_conversation():
     return [], [], gr.update(value="", visible=False)
+
+
+# ── Pending payment panel helpers ─────────────────────────────────────────────
+
+def _current_user_id(current_user: str | None, request: gr.Request) -> str | None:
+    """Resolve the active user_id from Gradio state or FastAPI session."""
+    if request and request.request:
+        session_user_id = request.request.session.get("user_id")
+        if session_user_id:
+            return session_user_id
+
+        session_email = request.request.session.get("user_email")
+        if session_email:
+            profile = query_user_profile(session_email)
+            return profile["user_id"] if profile else None
+
+    if current_user:
+        profile = query_user_profile(current_user)
+        return profile["user_id"] if profile else None
+    return None
+
+
+def _format_remaining_time(seconds: int | float | None) -> str:
+    """Format pending payment countdown seconds as mm:ss."""
+    remaining = max(0, int(seconds or 0))
+    return f"{remaining // 60:02d}:{remaining % 60:02d}"
+
+
+def _display_order_id(order_id: str) -> str:
+    """Show user-facing order IDs without the internal ORD- prefix."""
+    return order_id[4:] if order_id.startswith("ORD-") else order_id
+
+
+def _pending_order_updates(user_id: str | None):
+    """Build table, dropdown, and status updates for pending orders."""
+    if not user_id:
+        return (
+            [],
+            gr.update(choices=[], value=None),
+            gr.update(value="Login to view pending booking payments."),
+        )
+
+    orders = query_pending_orders(user_id)
+    rows = []
+    choices = []
+    for order in orders:
+        visible_order_id = _display_order_id(order["order_id"])
+        label = f"{visible_order_id} · {order['network_type']} · ${order['amount_usd']:.2f}"
+        choices.append((label, order["order_id"]))
+        rows.append([
+            visible_order_id,
+            order["network_type"],
+            f"{order['origin_name']} → {order['destination_name']}",
+            order["travel_date"],
+            f"${order['amount_usd']:.2f}",
+            _format_remaining_time(order["remaining_seconds"]),
+            order["payment_status"],
+        ])
+
+    message = (
+        f"{len(rows)} pending order(s). Confirm payment before the timer expires."
+        if rows else
+        "No pending booking payments."
+    )
+    selected = choices[0][1] if choices else None
+    return rows, gr.update(choices=choices, value=selected), gr.update(value=message)
+
+
+def refresh_pending_orders(current_user: str | None, request: gr.Request):
+    """Refresh the sidebar list of unpaid pending orders."""
+    user_id = _current_user_id(current_user, request)
+    return _pending_order_updates(user_id)
+
+
+def confirm_selected_pending_order(order_id: str | None, current_user: str | None, request: gr.Request):
+    """Confirm payment for the selected pending order."""
+    user_id = _current_user_id(current_user, request)
+    if not user_id:
+        rows, select_update, _ = _pending_order_updates(None)
+        return rows, select_update, gr.update(value="Please log in before confirming payment.")
+    if not order_id:
+        rows, select_update, _ = _pending_order_updates(user_id)
+        return rows, select_update, gr.update(value="Select a pending order first.")
+
+    ok, result = confirm_pending_payment(user_id, order_id)
+    rows, select_update, _ = _pending_order_updates(user_id)
+    if not ok:
+        return rows, select_update, gr.update(value=str(result))
+    return rows, select_update, gr.update(value=f"Payment confirmed for {_display_order_id(result['order_id'])}.")
+
+
+def cancel_selected_pending_order(order_id: str | None, current_user: str | None, request: gr.Request):
+    """Cancel the selected pending order and release its reservation."""
+    user_id = _current_user_id(current_user, request)
+    if not user_id:
+        rows, select_update, _ = _pending_order_updates(None)
+        return rows, select_update, gr.update(value="Please log in before cancelling a booking.")
+    if not order_id:
+        rows, select_update, _ = _pending_order_updates(user_id)
+        return rows, select_update, gr.update(value="Select a pending order first.")
+
+    ok, result = cancel_pending_order(user_id, order_id)
+    rows, select_update, _ = _pending_order_updates(user_id)
+    if not ok:
+        return rows, select_update, gr.update(value=str(result))
+    return rows, select_update, gr.update(value=f"Booking cancelled and released for {_display_order_id(result['order_id'])}.")
 
 
 # ── Provider / model selection ────────────────────────────────────────────────
@@ -689,6 +805,38 @@ with gr.Blocks(title="TransitFlow") as demo:
 
             gr.Markdown("---")
 
+            # Pending payment orders — refreshed by login, booking actions, and a timer.
+            with gr.Column(elem_classes="pending-orders-panel"):
+                gr.Markdown("### Pending Orders")
+                pending_order_msg = gr.Markdown("Login to view pending booking payments.")
+                pending_orders_table = gr.Dataframe(
+                    headers=[
+                        "Order ID",
+                        "Network",
+                        "Route",
+                        "Date",
+                        "Amount",
+                        "Time left",
+                        "Payment",
+                    ],
+                    datatype=["str", "str", "str", "str", "str", "str", "str"],
+                    row_count=0,
+                    column_count=7,
+                    interactive=False,
+                    wrap=True,
+                    label="Pending booking payments",
+                )
+                pending_order_select = gr.Dropdown(
+                    choices=[],
+                    label="Selected order",
+                    interactive=True,
+                )
+                with gr.Row():
+                    confirm_payment_btn = gr.Button("Confirm Payment", variant="primary", size="sm")
+                    cancel_pending_btn = gr.Button("Cancel Booking", size="sm")
+
+            gr.Markdown("---")
+
             gr.Markdown("### 💡 Try these examples")
             for example in EXAMPLES:
                 gr.Button(example, size="sm").click(
@@ -697,6 +845,8 @@ with gr.Blocks(title="TransitFlow") as demo:
                     show_progress="hidden",
                     queue=False,
                 )
+
+    pending_order_timer = gr.Timer(value=5, active=True)
 
     # ── Event wiring ──────────────────────────────────────────────────
 
@@ -718,6 +868,14 @@ with gr.Blocks(title="TransitFlow") as demo:
         queue=False,
     )
 
+    demo.load(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+        queue=False,
+    )
+
     chat_model_dropdown.change(
         fn=on_chat_model_change,
         inputs=chat_model_dropdown,
@@ -730,13 +888,23 @@ with gr.Blocks(title="TransitFlow") as demo:
         fn=chat,
         inputs=[msg, chatbot, agent_history_state, debug_toggle, current_user_state],
         outputs=[chatbot, agent_history_state, debug_panel],
-    ).then(fn=lambda: "", outputs=msg)
+    ).then(fn=lambda: "", outputs=msg).then(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+    )
 
     msg.submit(
         fn=chat,
         inputs=[msg, chatbot, agent_history_state, debug_toggle, current_user_state],
         outputs=[chatbot, agent_history_state, debug_panel],
-    ).then(fn=lambda: "", outputs=msg)
+    ).then(fn=lambda: "", outputs=msg).then(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+    )
 
     clear_btn.click(
         fn=clear_conversation,
@@ -804,6 +972,12 @@ with gr.Blocks(title="TransitFlow") as demo:
         ],
         show_progress="hidden",
         queue=False,
+    ).then(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+        queue=False,
     )
 
     # Logout
@@ -820,6 +994,12 @@ with gr.Blocks(title="TransitFlow") as demo:
             forgot_panel,
             google_complete_panel,
         ],
+        show_progress="hidden",
+        queue=False,
+    ).then(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
         show_progress="hidden",
         queue=False,
     )
@@ -842,6 +1022,12 @@ with gr.Blocks(title="TransitFlow") as demo:
         ],
         show_progress="hidden",
         queue=False,
+    ).then(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+        queue=False,
     )
 
     # Complete Google signup after OAuth verifies identity.
@@ -857,6 +1043,36 @@ with gr.Blocks(title="TransitFlow") as demo:
             logout_btn,
             google_complete_panel,
         ],
+        show_progress="hidden",
+        queue=False,
+    ).then(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+        queue=False,
+    )
+
+    confirm_payment_btn.click(
+        fn=confirm_selected_pending_order,
+        inputs=[pending_order_select, current_user_state],
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+        queue=False,
+    )
+
+    cancel_pending_btn.click(
+        fn=cancel_selected_pending_order,
+        inputs=[pending_order_select, current_user_state],
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
+        show_progress="hidden",
+        queue=False,
+    )
+
+    pending_order_timer.tick(
+        fn=refresh_pending_orders,
+        inputs=current_user_state,
+        outputs=[pending_orders_table, pending_order_select, pending_order_msg],
         show_progress="hidden",
         queue=False,
     )
