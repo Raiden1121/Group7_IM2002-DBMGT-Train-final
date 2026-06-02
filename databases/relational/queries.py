@@ -83,6 +83,28 @@ def _gen_unique_payment_id(cur) -> str:
         payment_id = _gen_payment_id()
 
 
+# Generate an unused metro trip ID within the current transaction.
+def _gen_unique_metro_trip_id(cur) -> str:
+    """Generate a metro trip ID that is not already used by travel_journeys."""
+    while True:
+        suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        trip_id = f"MT-{suffix}"
+        cur.execute("SELECT 1 FROM travel_journeys WHERE journey_id = %s", (trip_id,))
+        if not cur.fetchone():
+            return trip_id
+
+
+# Generate an unused feedback ID within the current transaction.
+def _gen_unique_feedback_id(cur) -> str:
+    """Generate a feedback ID that is not already used by journey_feedback."""
+    while True:
+        suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+        feedback_id = f"FB-{suffix}"
+        cur.execute("SELECT 1 FROM journey_feedback WHERE feedback_id = %s", (feedback_id,))
+        if not cur.fetchone():
+            return feedback_id
+
+
 # Generate a candidate local user ID.
 def _gen_user_id() -> str:
     return f"RU{random.randint(100000, 999999)}"
@@ -523,6 +545,347 @@ def query_payment_info(booking_id: str, user_id: str | None = None) -> Optional[
             return _to_jsonable(cur.fetchone())
 
 
+# ── ADDED USER ACCOUNT / METRO / FEEDBACK QUERIES ────────────────────────────
+
+# Fetch active payment methods owned by one user without exposing token data.
+def query_user_payment_methods(user_id: str) -> list[dict]:
+    """Return active payment instruments for a user, excluding token_ref."""
+    user_id = user_id.strip()
+    sql = """
+        SELECT
+            payment_instrument_id,
+            method_type,
+            provider_name,
+            last4,
+            is_active,
+            created_at
+        FROM payment_instruments
+        WHERE user_id = %s
+          AND is_active = TRUE
+        ORDER BY created_at DESC, payment_instrument_id
+    """
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (user_id,))
+            return [_to_jsonable(row) for row in cur.fetchall()]
+
+
+# Submit one feedback record for a journey owned by the user.
+def submit_feedback(
+    user_id: str,
+    journey_id: str,
+    rating: int,
+    comment: str | None,
+) -> tuple[bool, dict | str]:
+    """Create feedback for a user's own journey and prevent duplicate reviews."""
+    user_id = user_id.strip()
+    journey_id = journey_id.strip()
+    comment = comment.strip() if comment else None
+
+    try:
+        rating = int(rating)
+    except (TypeError, ValueError):
+        return False, "Rating must be an integer between 1 and 5."
+    if rating < 1 or rating > 5:
+        return False, "Rating must be between 1 and 5."
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT tj.journey_id, to_tbl.user_id, to_tbl.network_type
+                FROM travel_journeys tj
+                JOIN travel_orders to_tbl
+                  ON to_tbl.order_id = tj.order_id
+                WHERE tj.journey_id = %s
+                """,
+                (journey_id,),
+            )
+            journey = cur.fetchone()
+            if not journey:
+                conn.rollback()
+                return False, "Journey not found."
+            if journey["user_id"] != user_id:
+                conn.rollback()
+                return False, "Journey does not belong to this user."
+
+            cur.execute(
+                """
+                SELECT feedback_id
+                FROM journey_feedback
+                WHERE journey_id = %s
+                  AND user_id = %s
+                """,
+                (journey_id, user_id),
+            )
+            if cur.fetchone():
+                conn.rollback()
+                return False, "Feedback has already been submitted for this journey."
+
+            feedback_id = _gen_unique_feedback_id(cur)
+            cur.execute(
+                """
+                INSERT INTO feedback (
+                    feedback_id, user_id, booking_id, metro_trip_id, rating, comment, submitted_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    feedback_id,
+                    user_id,
+                    journey_id if journey["network_type"] == "national_rail" else None,
+                    journey_id if journey["network_type"] == "metro" else None,
+                    rating,
+                    comment,
+                ),
+            )
+            conn.commit()
+            return True, {
+                "feedback_id": feedback_id,
+                "user_id": user_id,
+                "journey_id": journey_id,
+                "rating": rating,
+                "comment": comment,
+                "status": "submitted",
+            }
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+# Fetch feedback submitted by one user, optionally for a single journey.
+def query_feedback(user_id: str, journey_id: str | None = None) -> list[dict]:
+    """Return feedback records owned by the user."""
+    user_id = user_id.strip()
+    journey_id = journey_id.strip() if journey_id else None
+    sql = """
+        SELECT
+            jf.feedback_id,
+            jf.journey_id,
+            to_tbl.network_type,
+            CASE WHEN to_tbl.network_type = 'national_rail' THEN jf.journey_id ELSE NULL END AS booking_id,
+            CASE WHEN to_tbl.network_type = 'metro' THEN jf.journey_id ELSE NULL END AS metro_trip_id,
+            jf.rating,
+            jf.comment,
+            jf.submitted_at
+        FROM journey_feedback jf
+        JOIN travel_journeys tj
+          ON tj.journey_id = jf.journey_id
+        JOIN travel_orders to_tbl
+          ON to_tbl.order_id = tj.order_id
+        WHERE jf.user_id = %s
+          AND to_tbl.user_id = %s
+          AND (%s IS NULL OR jf.journey_id = %s)
+        ORDER BY jf.submitted_at DESC
+    """
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (user_id, user_id, journey_id, journey_id))
+            return [_to_jsonable(row) for row in cur.fetchall()]
+
+
+# Buy a metro ticket and record the matching payment transaction.
+def buy_metro_ticket(
+    user_id: str,
+    schedule_id: str,
+    origin_station_id: str,
+    destination_station_id: str,
+    travel_date: str,
+    ticket_type: str = "single",
+    payment_instrument_id: str | None = None,
+) -> tuple[bool, dict | str]:
+    """Create a metro trip for an active user and charge the selected payment method."""
+    user_id = user_id.strip()
+    schedule_id = schedule_id.strip()
+    origin_station_id = origin_station_id.strip()
+    destination_station_id = destination_station_id.strip()
+    travel_date = travel_date.strip()
+    ticket_type = ticket_type.strip().lower()
+    payment_instrument_id = payment_instrument_id.strip() if payment_instrument_id else None
+
+    if ticket_type not in {"single", "day_pass"}:
+        return False, "Metro ticket type must be single or day_pass."
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT user_id, is_active
+                FROM registered_users
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            user = cur.fetchone()
+            if not user:
+                conn.rollback()
+                return False, "User not found."
+            if not user["is_active"]:
+                conn.rollback()
+                return False, "User account is inactive."
+
+            cur.execute(
+                """
+                SELECT
+                    s.schedule_id,
+                    o.stop_order AS origin_stop_order,
+                    d.stop_order AS destination_stop_order,
+                    d.stop_order - o.stop_order AS stops_travelled
+                FROM metro_schedules s
+                JOIN metro_schedule_stops o
+                  ON o.schedule_id = s.schedule_id
+                JOIN metro_schedule_stops d
+                  ON d.schedule_id = s.schedule_id
+                WHERE s.schedule_id = %s
+                  AND o.station_id = %s
+                  AND d.station_id = %s
+                  AND o.stop_order < d.stop_order
+                """,
+                (schedule_id, origin_station_id, destination_station_id),
+            )
+            route = cur.fetchone()
+            if not route:
+                conn.rollback()
+                return False, "Metro schedule does not serve the selected stations in that order."
+
+            if ticket_type == "day_pass":
+                amount_usd = 5.0
+            else:
+                cur.execute(
+                    """
+                    SELECT base_fare_usd + (per_stop_rate_usd * %s) AS total_fare_usd
+                    FROM metro_schedules
+                    WHERE schedule_id = %s
+                    """,
+                    (route["stops_travelled"], schedule_id),
+                )
+                fare = cur.fetchone()
+                if not fare:
+                    conn.rollback()
+                    return False, "Metro fare information not found."
+                amount_usd = float(fare["total_fare_usd"])
+
+            if not payment_instrument_id:
+                conn.rollback()
+                return False, "No active saved payment method selected. Please add or choose a payment method before buying a ticket."
+
+            cur.execute(
+                """
+                SELECT payment_instrument_id
+                FROM payment_instruments
+                WHERE payment_instrument_id = %s
+                  AND user_id = %s
+                  AND is_active = TRUE
+                """,
+                (payment_instrument_id, user_id),
+            )
+            if not cur.fetchone():
+                conn.rollback()
+                return False, "Payment instrument not found or inactive for this user."
+
+            trip_id = _gen_unique_metro_trip_id(cur)
+            payment_id = _gen_unique_payment_id(cur)
+
+            cur.execute(
+                """
+                INSERT INTO metro_travel_history (
+                    trip_id, user_id, schedule_id, origin_station_id, destination_station_id,
+                    travel_date, ticket_type, day_pass_ref, stops_travelled, amount_usd,
+                    status, purchased_at, travelled_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, %s, %s, %s, NOW(), NOW())
+                """,
+                (
+                    trip_id,
+                    user_id,
+                    schedule_id,
+                    origin_station_id,
+                    destination_station_id,
+                    travel_date,
+                    ticket_type,
+                    route["stops_travelled"],
+                    amount_usd,
+                    "completed",
+                ),
+            )
+            cur.execute(
+                """
+                INSERT INTO payment_transactions (
+                    payment_id, order_id, payment_instrument_id, transaction_type,
+                    amount_usd, currency_code, payment_status, gateway_reference, processed_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NULL, NOW())
+                """,
+                (
+                    payment_id,
+                    f"ORD-{trip_id}",
+                    payment_instrument_id,
+                    "charge",
+                    amount_usd,
+                    "USD",
+                    "paid",
+                ),
+            )
+            conn.commit()
+            return True, {
+                "trip_id": trip_id,
+                "payment_id": payment_id,
+                "payment_instrument_id": payment_instrument_id,
+                "user_id": user_id,
+                "schedule_id": schedule_id,
+                "origin_station_id": origin_station_id,
+                "destination_station_id": destination_station_id,
+                "travel_date": travel_date,
+                "ticket_type": ticket_type,
+                "stops_travelled": route["stops_travelled"],
+                "amount_usd": amount_usd,
+                "status": "completed",
+                "payment_status": "paid",
+            }
+    except psycopg2.errors.UniqueViolation as e:
+        conn.rollback()
+        constraint_name = getattr(e.diag, "constraint_name", None)
+        if constraint_name in {"travel_orders_pkey", "travel_orders_order_code_key", "travel_journeys_pkey"}:
+            return False, "Generated metro trip ID already exists. Please try again."
+        if constraint_name == "payment_transactions_pkey":
+            return False, "Generated payment ID already exists. Please try again."
+        return False, f"Metro ticket could not be completed because of a duplicate record: {constraint_name}."
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+# Fetch recent login audit entries for one user only.
+def query_my_login_audit(user_id: str, limit: int = 10) -> list[dict]:
+    """Return the user's own login audit results without IP or user-agent hashes."""
+    user_id = user_id.strip()
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 50))
+
+    sql = """
+        SELECT result, occurred_at
+        FROM auth_login_audit
+        WHERE user_id = %s
+        ORDER BY occurred_at DESC
+        LIMIT %s
+    """
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (user_id, limit))
+            return [_to_jsonable(row) for row in cur.fetchall()]
+
+
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
 
 # Create a rail booking and record a paid charge transaction.
@@ -549,7 +912,7 @@ def execute_booking(
         fare_class:             "standard" or "first"
         seat_id:                e.g. "B05" (or "any" to auto-assign)
         ticket_type:            "single" (default) or "return"
-        payment_instrument_id:  optional saved payment method owned by the user
+        payment_instrument_id:  required saved payment method owned by the user
 
     Returns:
         (True, booking_dict)   on success
@@ -675,20 +1038,23 @@ def execute_booking(
                 conn.rollback()
                 return False, "Fare information not found."
 
-            if payment_instrument_id:
-                cur.execute(
-                    """
-                    SELECT payment_instrument_id
-                    FROM payment_instruments
-                    WHERE payment_instrument_id = %s
-                      AND user_id = %s
-                      AND is_active = TRUE
-                    """,
-                    (payment_instrument_id, user_id),
-                )
-                if not cur.fetchone():
-                    conn.rollback()
-                    return False, "Payment instrument not found or inactive for this user."
+            if not payment_instrument_id:
+                conn.rollback()
+                return False, "No active saved payment method selected. Please add or choose a payment method before booking."
+
+            cur.execute(
+                """
+                SELECT payment_instrument_id
+                FROM payment_instruments
+                WHERE payment_instrument_id = %s
+                  AND user_id = %s
+                  AND is_active = TRUE
+                """,
+                (payment_instrument_id, user_id),
+            )
+            if not cur.fetchone():
+                conn.rollback()
+                return False, "Payment instrument not found or inactive for this user."
 
             booking_id = _gen_unique_booking_id(cur)
             payment_id = _gen_unique_payment_id(cur)

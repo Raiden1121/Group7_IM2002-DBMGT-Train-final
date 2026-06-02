@@ -46,6 +46,11 @@ from databases.relational.queries import (
     query_user_bookings,
     # Added tool query: payment lookup for a booking or metro trip.
     query_payment_info,
+    query_user_payment_methods,
+    submit_feedback,
+    query_feedback,
+    buy_metro_ticket,
+    query_my_login_audit,
     execute_booking,
     execute_cancellation,
     query_policy_vector_search,
@@ -201,7 +206,7 @@ TOOLS = [
         "description": (
             "Create a national rail booking for the logged-in user. "
             "REQUIRES LOGIN. Only call after the user has explicitly confirmed all booking details. "
-            "Do NOT call this speculatively."
+            "Requires an active saved payment method ID. Do NOT call this speculatively."
         ),
         "parameters": {
             "schedule_id":            {"type": "string", "description": "e.g. NR_SCH01"},
@@ -211,6 +216,7 @@ TOOLS = [
             "fare_class":             {"type": "string", "description": "standard or first"},
             "seat_id":                {"type": "string", "description": "Specific seat ID (e.g. B05) or 'any' for auto-assign"},
             "ticket_type":            {"type": "string", "description": "single or return (default single)"},
+            "payment_instrument_id":  {"type": "string", "description": "Required active saved payment method ID"},
         },
         "required": ["schedule_id", "origin_station_id", "destination_station_id", "travel_date", "fare_class", "seat_id"],
     },
@@ -301,6 +307,70 @@ TOOLS = [
         },
         "required": ["booking_id"],
     },
+    {
+        "name": "get_user_payment_methods",
+        "description": (
+            "List the logged-in user's active saved payment methods. "
+            "Requires login and never returns secure payment tokens."
+        ),
+        "parameters": {},
+        "required": [],
+    },
+    {
+        "name": "submit_feedback",
+        "description": (
+            "Create new feedback for one of the logged-in user's own bookings or trips. "
+            "Use when the user says they want to rate, review, give stars, leave feedback, or submit a comment for a booking/trip. "
+            "If the message includes a BK/MT reference plus a rating, stars, or comment, use this tool instead of get_feedback. "
+            "Do not use this for show, view, list, check, history, or feedback I have already submitted."
+        ),
+        "parameters": {
+            "journey_id": {"type": "string", "description": "Booking or trip reference e.g. BK001 or MT009"},
+            "rating": {"type": "integer", "description": "Rating from 1 to 5"},
+            "comment": {"type": "string", "description": "Optional feedback comment"},
+        },
+        "required": ["journey_id", "rating"],
+    },
+    {
+        "name": "get_feedback",
+        "description": (
+            "Read feedback already submitted by the logged-in user. "
+            "Use only when the user asks to show, view, list, check, retrieve, or see feedback they have submitted. "
+            "Do not use when the user gives a new rating, stars, review, or comment; use submit_feedback for that."
+        ),
+        "parameters": {
+            "journey_id": {"type": "string", "description": "Optional booking or trip reference e.g. BK001 or MT009"},
+        },
+        "required": [],
+    },
+    {
+        "name": "buy_metro_ticket",
+        "description": (
+            "Create a new metro ticket purchase for the logged-in user. "
+            "Use when the user says buy, purchase, book, or get a metro single ticket/day pass and provides schedule, origin, destination, and travel date. "
+            "Requires an active saved payment method ID. Do not use check_metro_availability for confirmed purchase requests."
+        ),
+        "parameters": {
+            "schedule_id": {"type": "string", "description": "e.g. MS_SCH01"},
+            "origin_station_id": {"type": "string", "description": "Metro station ID e.g. MS01"},
+            "destination_station_id": {"type": "string", "description": "Metro station ID e.g. MS04"},
+            "travel_date": {"type": "string", "description": "YYYY-MM-DD"},
+            "ticket_type": {"type": "string", "description": "single or day_pass"},
+            "payment_instrument_id": {"type": "string", "description": "Required active saved payment method ID"},
+        },
+        "required": ["schedule_id", "origin_station_id", "destination_station_id", "travel_date"],
+    },
+    {
+        "name": "get_my_login_history",
+        "description": (
+            "Show the logged-in user's own recent login audit records. "
+            "Does not expose IP hash or user-agent hash."
+        ),
+        "parameters": {
+            "limit": {"type": "integer", "description": "Maximum records to return, default 10"},
+        },
+        "required": [],
+    },
 ]
 
 TOOLS_SCHEMA = """\
@@ -311,16 +381,21 @@ check_metro_availability(origin_id, destination_id)
 calculate_metro_fare(schedule_id, stops_travelled)
 get_available_seats(schedule_id, travel_date, fare_class)
 recommend_adjacent_seats(schedule_id, travel_date, fare_class, count)
-make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id, ticket_type?)
+make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id, ticket_type?, payment_instrument_id?)
 cancel_booking(booking_id)
 get_user_bookings()
 get_payment_info(booking_id)
+get_user_payment_methods()
+submit_feedback(journey_id, rating, comment?)
+get_feedback(journey_id?)
+buy_metro_ticket(schedule_id, origin_station_id, destination_station_id, travel_date, ticket_type?, payment_instrument_id?)
+get_my_login_history(limit?)
 search_policy(query)
 find_alternative_routes(origin_id, destination_id, avoid_station_id, network?)
 get_delay_ripple(station_id, hops?)"""
 
 
-# Added tool schema entry: get_payment_info(booking_id).
+# Added tool schema entries for payment, feedback, metro purchase, and login audit.
 # ── Agent logic ───────────────────────────────────────────────────────────────
 
 def _execute_tool(
@@ -391,6 +466,72 @@ def _execute_tool(
             if not result:
                 result = {"error": "Payment not found for this user's booking or trip."}
 
+        # Added tool dispatch: saved payment methods for the logged-in user only.
+        elif tool_name == "get_user_payment_methods":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to view payment methods."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            result = query_user_payment_methods(profile["user_id"])
+
+        # Added tool dispatch: feedback submission for the logged-in user's own journey.
+        elif tool_name == "submit_feedback":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to submit feedback."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            ok, data = submit_feedback(
+                user_id=profile["user_id"],
+                journey_id=params["journey_id"],
+                rating=params["rating"],
+                comment=params.get("comment"),
+            )
+            result = data if ok else {"error": data}
+
+        # Added tool dispatch: feedback lookup for the logged-in user only.
+        elif tool_name == "get_feedback":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to view feedback."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            result = query_feedback(
+                user_id=profile["user_id"],
+                journey_id=params.get("journey_id"),
+            )
+
+        # Added tool dispatch: metro ticket purchase for the logged-in user.
+        elif tool_name == "buy_metro_ticket":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to buy a metro ticket."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            ok, data = buy_metro_ticket(
+                user_id=profile["user_id"],
+                schedule_id=params["schedule_id"],
+                origin_station_id=params["origin_station_id"],
+                destination_station_id=params["destination_station_id"],
+                travel_date=params["travel_date"],
+                ticket_type=params.get("ticket_type", "single"),
+                payment_instrument_id=params.get("payment_instrument_id"),
+            )
+            result = data if ok else {"error": data}
+
+        # Added tool dispatch: login audit lookup for the logged-in user only.
+        elif tool_name == "get_my_login_history":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to view login history."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            result = query_my_login_audit(
+                user_id=profile["user_id"],
+                limit=params.get("limit", 10),
+            )
+
         elif tool_name == "get_available_seats":
             result = query_available_seats(**params)
         
@@ -428,6 +569,7 @@ def _execute_tool(
                 fare_class=params["fare_class"],
                 seat_id=params["seat_id"],
                 ticket_type=params.get("ticket_type", "single"),
+                payment_instrument_id=params.get("payment_instrument_id"),
             )
             result = data if ok else {"error": data}
 
@@ -643,8 +785,14 @@ STATIONS: Metro=MS01-MS20, Rail=NR01-NR10
 USER: {current_user_email or "not logged in"}
 get_user_bookings: call (no params) when logged-in user asks about their bookings, tickets, or travel history.
 get_payment_info: call with booking_id when user asks payment status, payment method, paid amount, or refund status for a BK/MT reference.
+get_user_payment_methods: call when logged-in user asks for saved cards, wallets, or payment methods.
+submit_feedback: call when logged-in user gives a new rating, stars, review, or comment for a booking/trip.
+get_feedback: read-only; call when logged-in user asks to show/list/view/check feedback they have submitted. Never pass rating/comment to get_feedback.
+buy_metro_ticket: call when logged-in user wants to buy, purchase, book, or get a metro ticket/day pass and provides schedule, stations, date, and payment method ID.
+get_my_login_history: call when logged-in user asks about recent login history or audit records.
 make_booking/cancel_booking: only if user is logged in.
 Route/path/journey questions: use find_route. Policy questions: use search_policy.
+Priority: purchase intent uses buy_metro_ticket, not check_metro_availability. New rating/comment intent uses submit_feedback, not get_feedback. Show/list/view submitted feedback uses get_feedback, not submit_feedback.
 Never use "" as a param value. Omit optional params if unknown.
 
 TOOLS:
@@ -677,6 +825,13 @@ JSON:"""
                 f"Logged-in user: {current_user_email or 'none'}. "
                 "My bookings/tickets/travel history → get_user_bookings (no params). "
                 "Payment status/method/amount/refund for a BK/MT reference → get_payment_info. "
+                "Saved cards/wallets/payment methods → get_user_payment_methods. "
+                "If the user gives a new rating, stars, review, or comment for a BK/MT reference, call submit_feedback. "
+                "get_feedback is read-only; never call get_feedback with rating/comment params. "
+                "Show/list/view/check feedback the user has submitted → get_feedback. "
+                "Recent login history/audit → get_my_login_history. "
+                "Buy/purchase/book/get a metro ticket or day pass with schedule, stations, date, and payment method ID → buy_metro_ticket. "
+                "Do not use check_metro_availability for confirmed metro purchase requests. "
                 "Book a ticket / make a booking → check_national_rail_availability first, then make_booking. "
                 "Cancel a booking → cancel_booking. "
                 "Policy/rules/conduct/compensation/luggage/bicycle questions → search_policy. "
@@ -705,6 +860,8 @@ JSON:"""
     _lower = _augmented_message.lower()
     _station_ids = re.findall(r'\b(MS\d{2}|NR\d{2})\b', _augmented_message, re.IGNORECASE)
     _two_stations = len(_station_ids) >= 2
+    _date_match = re.search(r'\b\d{4}-\d{2}-\d{2}\b', _augmented_message)
+    _travel_date = _date_match.group(0) if _date_match else None
 
     def _tool_selected(name: str, *required_params) -> bool:
         """Return True only if tool `name` is in tool_calls with all required params set."""
@@ -734,15 +891,35 @@ JSON:"""
                   {"origin_id": _station_ids[0].upper(), "destination_id": _station_ids[1].upper(), "optimise_by": _opt},
                   "route query")
 
-    # 2. Availability / trains / schedules between two stations
+    # 2. Metro ticket purchase — keeps confirmed purchases out of availability fallback
+    elif not tool_calls and _two_stations:
+        _purchase_triggers = {"buy", "purchase", "book", "get me", "get a", "ticket", "day pass"}
+        _is_metro_purchase = (
+            any(kw in _lower for kw in _purchase_triggers)
+            and "metro" in _lower
+            and any(kw in _lower for kw in ["ticket", "day pass"])
+        )
+        _schedule_match = re.search(r'\bMS_SCH\d{2}\b', _augmented_message, re.IGNORECASE)
+        if _is_metro_purchase and _schedule_match and _travel_date:
+            _ticket_type = "day_pass" if "day pass" in _lower else "single"
+            _fallback(
+                "buy_metro_ticket",
+                {
+                    "schedule_id": _schedule_match.group(0).upper(),
+                    "origin_station_id": _station_ids[0].upper(),
+                    "destination_station_id": _station_ids[1].upper(),
+                    "travel_date": _travel_date,
+                    "ticket_type": _ticket_type,
+                },
+                "metro ticket purchase query",
+            )
+
+    # 3. Availability / trains / schedules between two stations
     elif not tool_calls and _two_stations:
         _avail_triggers = {"train", "trains", "service", "services", "run from", "runs from",
                            "schedule", "timetable", "available", "availability"}
         if any(kw in _lower for kw in _avail_triggers):
             o, d = _station_ids[0].upper(), _station_ids[1].upper()
-            _travel_date = next(
-                (w for w in _lower.split() if re.match(r'\d{4}-\d{2}-\d{2}', w)), None
-            )
             _params = {"origin_id": o, "destination_id": d}
             if _travel_date:
                 _params["travel_date"] = _travel_date
