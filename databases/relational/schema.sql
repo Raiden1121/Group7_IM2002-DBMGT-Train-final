@@ -94,6 +94,7 @@ DROP TABLE IF EXISTS payment_instruments CASCADE;
 DROP TABLE IF EXISTS rail_journey_reservations CASCADE;
 DROP TABLE IF EXISTS travel_journeys CASCADE;
 DROP TABLE IF EXISTS travel_orders CASCADE;
+DROP TABLE IF EXISTS seat_locks CASCADE;
 
 DROP TABLE IF EXISTS refund_policy_windows CASCADE;
 DROP TABLE IF EXISTS refund_policy_ticket_types CASCADE;
@@ -107,6 +108,7 @@ DROP TABLE IF EXISTS user_auth_credentials CASCADE;
 DROP TABLE IF EXISTS user_profiles CASCADE;
 DROP TABLE IF EXISTS user_oauth_accounts CASCADE;
 
+DROP TABLE IF EXISTS seat_locks CASCADE;
 DROP TABLE IF EXISTS seat_layout_seats CASCADE;
 DROP TABLE IF EXISTS seat_layout_coaches CASCADE;
 DROP TABLE IF EXISTS seat_layouts CASCADE;
@@ -615,6 +617,47 @@ CREATE UNIQUE INDEX uq_active_seat_reservation
 ON rail_journey_reservations (schedule_id, travel_date, seat_pk)
 WHERE reservation_status = 'active';
 
+-- ===========================================================================
+-- Seat Locks and Time-based Locking Mechanisms
+-- ===========================================================================
+
+-- [NEW] 新增臨時座位鎖定表 seat_locks
+-- 用來記錄訂票流程中的暫時性座位佔用。
+CREATE TABLE seat_locks (
+    lock_id TEXT PRIMARY KEY, -- 'LK-' || 6位隨機字串
+    user_id TEXT NOT NULL REFERENCES user_profiles(user_id) ON DELETE CASCADE,
+    schedule_id TEXT NOT NULL,
+    travel_date DATE NOT NULL,
+    seat_pk BIGINT NOT NULL,
+    locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL, -- 透過 Trigger 自動設定
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'released', 'confirmed')),
+    
+    CONSTRAINT fk_seat_locks_seat FOREIGN KEY (seat_pk) REFERENCES seat_layout_seats(seat_pk) ON DELETE CASCADE,
+    CONSTRAINT fk_seat_locks_schedule FOREIGN KEY (schedule_id) REFERENCES service_schedules(schedule_id) ON DELETE CASCADE
+);
+
+-- [NEW] 部分唯一索引 —— 業務排他鎖 (Exclusive Lock) 核心
+-- 確保同一班次、同一日期、同一座位在狀態為 pending 時，只能被一個使用者佔用
+CREATE UNIQUE INDEX uq_active_seat_lock
+ON seat_locks (schedule_id, travel_date, seat_pk)
+WHERE status = 'pending';
+
+-- [NEW] 自動計算過期時間的 Trigger 函數
+-- 在插入 seat_locks 時，自動將 expires_at 設定為 locked_at + 10 分鐘
+CREATE OR REPLACE FUNCTION set_seat_lock_expiry()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.expires_at := NEW.locked_at + INTERVAL '10 minutes';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_set_seat_lock_expiry
+BEFORE INSERT ON seat_locks
+FOR EACH ROW
+EXECUTE FUNCTION set_seat_lock_expiry();
+
 
 -- ---------------------------------------------------------------------------
 -- G. Payments
@@ -806,6 +849,7 @@ FROM seat_layouts;
 
 CREATE VIEW national_rail_seats AS
 SELECT
+    sls.seat_pk,
     sls.layout_id,
     slc.coach_code AS coach,
     sls.seat_code AS seat_id,
