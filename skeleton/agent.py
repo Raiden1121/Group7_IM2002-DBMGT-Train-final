@@ -51,6 +51,7 @@ from databases.relational.queries import (
     query_feedback,
     buy_metro_ticket,
     query_my_login_audit,
+    execute_booking_by_route,
     execute_booking,
     execute_cancellation,
     execute_lock_seat,
@@ -207,8 +208,9 @@ TOOLS = [
         "name": "make_booking",
         "description": (
             "Create a national rail booking for the logged-in user. "
-            "REQUIRES LOGIN. Only call after the user has explicitly confirmed all booking details. "
-            "If payment is omitted, create the booking with pending payment. Do NOT call this speculatively."
+            "REQUIRES LOGIN. Use when the user provides a schedule ID. "
+            "If seat or payment is omitted, create the booking with any available seat and pending payment. "
+            "Do NOT invent a schedule ID; use make_booking_by_route when the user only gives origin, destination, and date."
         ),
         "parameters": {
             "schedule_id":            {"type": "string", "description": "e.g. NR_SCH01"},
@@ -216,11 +218,30 @@ TOOLS = [
             "destination_station_id": {"type": "string", "description": "e.g. NR05"},
             "travel_date":            {"type": "string", "description": "YYYY-MM-DD"},
             "fare_class":             {"type": "string", "description": "standard or first"},
-            "seat_id":                {"type": "string", "description": "Specific seat ID (e.g. B05) or 'any' for auto-assign"},
+            "seat_id":                {"type": "string", "description": "Optional specific seat ID (e.g. B05) or 'any' for auto-assign"},
             "ticket_type":            {"type": "string", "description": "single or return (default single)"},
             "payment_instrument_id":  {"type": "string", "description": "Optional saved payment method ID. If omitted, create booking with pending payment."},
         },
-        "required": ["schedule_id", "origin_station_id", "destination_station_id", "travel_date", "fare_class", "seat_id"],
+        "required": ["schedule_id", "origin_station_id", "destination_station_id", "travel_date", "fare_class"],
+    },
+    {
+        "name": "make_booking_by_route",
+        "description": (
+            "Create a national rail booking for the logged-in user when they do not know the schedule ID. "
+            "Use for natural booking requests with origin station, destination station, travel date, and fare class. "
+            "The system selects a matching schedule and any available seat when seat is omitted. "
+            "If payment is omitted, create the booking with pending payment."
+        ),
+        "parameters": {
+            "origin_station_id":      {"type": "string", "description": "National rail origin station ID e.g. NR01"},
+            "destination_station_id": {"type": "string", "description": "National rail destination station ID e.g. NR05"},
+            "travel_date":            {"type": "string", "description": "YYYY-MM-DD"},
+            "fare_class":             {"type": "string", "description": "standard or first"},
+            "seat_id":                {"type": "string", "description": "Optional specific seat ID or 'any' for auto-assign"},
+            "ticket_type":            {"type": "string", "description": "single or return (default single)"},
+            "payment_instrument_id":  {"type": "string", "description": "Optional saved payment method ID. If omitted, create booking with pending payment."},
+        },
+        "required": ["origin_station_id", "destination_station_id", "travel_date", "fare_class"],
     },
     {
         "name": "cancel_booking",
@@ -237,9 +258,11 @@ TOOLS = [
     {
         "name": "search_policy",
         "description": (
-            "Search company policy documents. Use for any question about: "
-            "refunds, delay compensation, luggage, bicycles, pets, food and drink, "
-            "conduct, booking rules, ticket types, fare evasion, or child fares."
+            "Search company policy documents using RAG. Use for any question about policies, "
+            "rules, procedures, eligibility, passenger rights, travel conditions, ticket rules, "
+            "refunds, delay compensation, lost property, claiming items, customer service, "
+            "accessibility, luggage, bicycles, pets, food and drink, conduct, fare evasion, "
+            "child/student/senior fares, discounts, group bookings, deadlines, or booking conditions."
         ),
         "parameters": {
             "query": {"type": "string", "description": "Natural language question about policy"},
@@ -365,8 +388,9 @@ TOOLS = [
     {
         "name": "get_my_login_history",
         "description": (
-            "Show the logged-in user's own recent login audit records. "
-            "Does not expose IP hash or user-agent hash."
+            "Show the logged-in user's own recent account login/sign-in audit records only. "
+            "Use only when the user explicitly asks about their login history, sign-in history, "
+            "or audit log. Does not expose IP hash or user-agent hash."
         ),
         "parameters": {
             "limit": {"type": "integer", "description": "Maximum records to return, default 10"},
@@ -408,7 +432,8 @@ check_metro_availability(origin_id, destination_id)
 calculate_metro_fare(schedule_id, stops_travelled)
 get_available_seats(schedule_id, travel_date, fare_class)
 recommend_adjacent_seats(schedule_id, travel_date, fare_class, count)
-make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id, ticket_type?, payment_instrument_id?)
+make_booking(schedule_id, origin_station_id, destination_station_id, travel_date, fare_class, seat_id?, ticket_type?, payment_instrument_id?)
+make_booking_by_route(origin_station_id, destination_station_id, travel_date, fare_class, seat_id?, ticket_type?, payment_instrument_id?)
 cancel_booking(booking_id)
 get_user_bookings()
 get_payment_info(booking_id)
@@ -596,7 +621,25 @@ def _execute_tool(
                 destination_station_id=params["destination_station_id"],
                 travel_date=params["travel_date"],
                 fare_class=params["fare_class"],
-                seat_id=params["seat_id"],
+                seat_id=params.get("seat_id", "any"),
+                ticket_type=params.get("ticket_type", "single"),
+                payment_instrument_id=params.get("payment_instrument_id"),
+            )
+            result = data if ok else {"error": data}
+
+        elif tool_name == "make_booking_by_route":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to make a booking."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            ok, data = execute_booking_by_route(
+                user_id=profile["user_id"],
+                origin_station_id=params["origin_station_id"],
+                destination_station_id=params["destination_station_id"],
+                travel_date=params["travel_date"],
+                fare_class=params["fare_class"],
+                seat_id=params.get("seat_id", "any"),
                 ticket_type=params.get("ticket_type", "single"),
                 payment_instrument_id=params.get("payment_instrument_id"),
             )
@@ -815,7 +858,7 @@ def run_agent(
             f"\n\nLogged-in user: {user_display}. "
             "Answer personal booking queries for this user without asking for their email or ID. "
             "Use get_user_bookings() for any booking history request. "
-            "Use make_booking / cancel_booking for booking and cancellation requests."
+            "Use make_booking, make_booking_by_route, or cancel_booking for booking and cancellation requests."
         )
     else:
         contextual_prompt = SYSTEM_PROMPT + (
@@ -845,10 +888,14 @@ get_user_payment_methods: call when logged-in user asks for saved cards, wallets
 submit_feedback: call when logged-in user gives a new rating, stars, review, or comment for a booking/trip.
 get_feedback: read-only; call when logged-in user asks to show/list/view/check feedback they have submitted. Never pass rating/comment to get_feedback.
 buy_metro_ticket: call when logged-in user wants to buy, purchase, book, or get a metro ticket/day pass and provides schedule, stations, and date. Payment method ID is optional; omit it for pending payment.
-get_my_login_history: call when logged-in user asks about recent login history or audit records.
-make_booking/cancel_booking: only if user is logged in.
+get_my_login_history: call only when logged-in user explicitly asks about login history, sign-in history, or audit records.
+make_booking: call when logged-in user books national rail and explicitly provides schedule_id.
+make_booking_by_route: call when logged-in user books national rail using origin, destination, date, and fare class but no schedule_id.
+cancel_booking: only if user is logged in and asks to cancel a booking.
 Route/path/journey questions: use find_route. Policy questions: use search_policy.
-Priority: purchase intent uses buy_metro_ticket, not check_metro_availability. New rating/comment intent uses submit_feedback, not get_feedback. Show/list/view submitted feedback uses get_feedback, not submit_feedback.
+Policy/RAG questions include rules, procedures, eligibility, passenger rights, travel conditions, refunds, compensation, lost property, claiming items, customer service, accessibility, luggage, bicycles, pets, food, drink, conduct, fare evasion, ticket validity, discounts, group bookings, and deadlines.
+Use search_policy for policy/RAG intent even if the message mentions trains, tickets, booking, metro, or national rail.
+Priority: policy intent uses search_policy. Purchase intent uses buy_metro_ticket, not check_metro_availability. New rating/comment intent uses submit_feedback, not get_feedback. Show/list/view submitted feedback uses get_feedback, not submit_feedback.
 Never use "" as a param value. Omit optional params if unknown.
 
 TOOLS:
@@ -864,10 +911,12 @@ Examples:
 "cheapest NR01 to NR05" -> {{"tool_calls": [{{"name": "find_route", "params": {{"origin_id": "NR01", "destination_id": "NR05", "optimise_by": "cost"}}}}]}}
 "trains NR01 to NR03 on 2025-06-01" -> {{"tool_calls": [{{"name": "check_national_rail_availability", "params": {{"origin_id": "NR01", "destination_id": "NR03", "travel_date": "2025-06-01"}}}}]}}
 "refund policy" -> {{"tool_calls": [{{"name": "search_policy", "params": {{"query": "refund policy"}}}}]}}
+"discounts and booking deadlines for a group of 55 people" -> {{"tool_calls": [{{"name": "search_policy", "params": {{"query": "discounts and booking deadlines for a group of 55 people"}}}}]}}
+"I left my laptop and wallet on a metro train. What do I need to claim them?" -> {{"tool_calls": [{{"name": "search_policy", "params": {{"query": "lost property claim requirements for laptop and wallet on metro"}}}}]}}
 "hello" -> {{"tool_calls": []}}
 "show my bookings" -> {{"tool_calls": [{{"name": "get_user_bookings", "params": {{}}}}]}}
 "payment status of BK001" -> {{"tool_calls": [{{"name": "get_payment_info", "params": {{"booking_id": "BK001"}}}}]}}
-"book me a seat NR01 to NR05 on 2025-06-01" -> {{"tool_calls": [{{"name": "check_national_rail_availability", "params": {{"origin_id": "NR01", "destination_id": "NR05", "travel_date": "2025-06-01"}}}}]}}
+"book me a standard ticket NR01 to NR05 on 2025-06-01" -> {{"tool_calls": [{{"name": "make_booking_by_route", "params": {{"origin_station_id": "NR01", "destination_station_id": "NR05", "travel_date": "2025-06-01", "fare_class": "standard"}}}}]}}
 "delay ripple from Central Station (NR01) within a 3-hop radius" -> {{"tool_calls": [{{"name": "get_delay_ripple", "params": {{"station_id": "NR01", "hops": 3}}}}]}}
 
 JSON:"""
@@ -886,12 +935,14 @@ JSON:"""
                 "If the user gives a new rating, stars, review, or comment for a BK/MT reference, call submit_feedback. "
                 "get_feedback is read-only; never call get_feedback with rating/comment params. "
                 "Show/list/view/check feedback the user has submitted → get_feedback. "
-                "Recent login history/audit → get_my_login_history. "
+                "Explicit account login/sign-in history or audit log → get_my_login_history. "
                 "Buy/purchase/book/get a metro ticket or day pass with schedule, stations, and date → buy_metro_ticket. "
                 "Do not use check_metro_availability for confirmed metro purchase requests. "
-                "Book a ticket / make a booking → check_national_rail_availability first, then make_booking. "
+                "Book national rail with route/date/fare but no schedule_id → make_booking_by_route. "
+                "Book national rail with schedule_id → make_booking. "
                 "Cancel a booking → cancel_booking. "
-                "Policy/rules/conduct/compensation/luggage/bicycle questions → search_policy. "
+                "Policy/rules/procedures/eligibility/passenger rights/refunds/compensation/lost property/claiming items/customer service/accessibility/luggage/bicycle/pets/food/drink/conduct/fare evasion/discounts/group booking/deadlines/conditions → search_policy. "
+                "Use search_policy for policy/RAG intent even when the message also mentions trains, tickets, booking, metro, or national rail. "
                 "Route/directions/fastest/quickest/how-to-get/path questions → find_route ONLY (never get_metro_fare). "
                 "Delay ripple/disruption/system failure/affected-station questions → get_delay_ripple with station_id and hops if stated. "
                 "Metro fare/price/cost/how-much-does-it-cost questions → get_metro_fare. "
@@ -922,7 +973,7 @@ JSON:"""
         _sid = _sid.upper()
         if _sid not in _station_ids_unique:
             _station_ids_unique.append(_sid)
-    _two_stations = len(_station_ids) >= 2
+    _two_stations = len(_station_ids_unique) >= 2
     _date_match = re.search(r'\b\d{4}-\d{2}-\d{2}\b', _augmented_message)
     _travel_date = _date_match.group(0) if _date_match else None
 
@@ -939,6 +990,29 @@ JSON:"""
         tool_calls = [{"name": name, "params": params}]
         if debug:
             debug_info.append(f"**Fallback:** {reason} → {name}({params})")
+
+    # 0. Policy / RAG — overrides relational misroutes for unstructured policy intent.
+    _policy_triggers = {
+        "policy", "policies", "rule", "rules", "procedure", "procedures",
+        "condition", "conditions", "deadline", "deadlines", "eligibility", "eligible",
+        "entitled", "allowed", "permitted", "prohibited", "requirement", "requirements",
+        "need to bring", "bring to claim", "claim", "claiming", "proof", "valid id",
+        "refund", "refundable", "compensation", "delay repay", "cancel policy",
+        "discount", "discounts", "student fare", "senior fare", "child fare",
+        "group fare", "group fares", "group booking", "group bookings", "large group",
+        "lost property", "lost and found", "lost & found", "lost item", "lost items",
+        "left my", "forgot", "wallet", "laptop", "electronics", "jewelry", "cash",
+        "passport", "identification", "stored", "secure storage", "holding period",
+        "customer service", "complaint", "dispute", "help desk",
+        "accessibility", "wheelchair", "assisted boarding", "carer", "disability",
+        "service animal", "guide dog", "luggage", "baggage", "bicycle", "bicycles",
+        "bike", "scooter", "pet", "pets", "dog", "food", "drink", "alcohol",
+        "smoking", "vaping", "quiet zone", "priority seat", "conduct",
+        "fare evasion", "counterfeit", "non-transferable", "ticket validity",
+        "lost ticket", "lost tickets", "qr code", "digital ticket",
+    }
+    if any(kw in _lower for kw in _policy_triggers) and not _tool_selected("search_policy", "query"):
+        _fallback("search_policy", {"query": user_message.strip()}, "policy query")
 
     _hop_match = re.search(
         r'\b(?:within\s+)?(\d+)\s*[- ]?\s*hops?\b|\b(\d+)\s*[- ]?\s*hop\s+radius\b',
@@ -976,12 +1050,12 @@ JSON:"""
     _rail_schedule_match = re.search(r'\bNR_SCH\d{2}\b', _augmented_message, re.IGNORECASE)
     _is_rail_booking = (
         any(kw in _lower for kw in _booking_triggers)
-        and (_rail_schedule_match or "national rail" in _lower)
+        and (_rail_schedule_match or "national rail" in _lower or (_two_stations and _station_ids_unique[0].startswith("NR")))
     )
     if _is_route and _two_stations and not _tool_selected("find_route", "origin_id", "destination_id"):
         _opt = "cost" if any(kw in _lower for kw in ["cheap", "cheapest", "lowest cost"]) else "time"
         _fallback("find_route",
-                  {"origin_id": _station_ids[0].upper(), "destination_id": _station_ids[1].upper(), "optimise_by": _opt},
+                  {"origin_id": _station_ids_unique[0], "destination_id": _station_ids_unique[1], "optimise_by": _opt},
                   "route query")
 
     # 2. National rail booking — overrides fare/availability misroutes for confirmed booking intent
@@ -998,14 +1072,37 @@ JSON:"""
             "make_booking",
             {
                 "schedule_id": _rail_schedule_match.group(0).upper(),
-                "origin_station_id": _station_ids[0].upper(),
-                "destination_station_id": _station_ids[1].upper(),
+                "origin_station_id": _station_ids_unique[0],
+                "destination_station_id": _station_ids_unique[1],
                 "travel_date": _travel_date,
                 "fare_class": "first" if "first" in _lower else "standard",
                 "seat_id": _seat_match.group(0).upper() if _seat_match else "any",
                 "ticket_type": _ticket_type,
             },
             "national rail booking query",
+        )
+
+    # 2b. National rail route booking — user gave route/date but not schedule_id
+    elif (
+        _two_stations
+        and _is_rail_booking
+        and not _rail_schedule_match
+        and _travel_date
+        and not _tool_selected("make_booking_by_route", "origin_station_id", "destination_station_id", "travel_date", "fare_class")
+    ):
+        _seat_match = re.search(r'\b[A-Z]\d{2}\b', _augmented_message)
+        _ticket_type = "return" if any(kw in _lower for kw in ["return", "round-trip", "round trip"]) else "single"
+        _fallback(
+            "make_booking_by_route",
+            {
+                "origin_station_id": _station_ids_unique[0],
+                "destination_station_id": _station_ids_unique[1],
+                "travel_date": _travel_date,
+                "fare_class": "first" if "first" in _lower else "standard",
+                "seat_id": _seat_match.group(0).upper() if _seat_match else "any",
+                "ticket_type": _ticket_type,
+            },
+            "national rail route booking query",
         )
 
     # 3. Metro ticket purchase — keeps confirmed purchases out of availability fallback
@@ -1023,8 +1120,8 @@ JSON:"""
                 "buy_metro_ticket",
                 {
                     "schedule_id": _schedule_match.group(0).upper(),
-                    "origin_station_id": _station_ids[0].upper(),
-                    "destination_station_id": _station_ids[1].upper(),
+                    "origin_station_id": _station_ids_unique[0],
+                    "destination_station_id": _station_ids_unique[1],
                     "travel_date": _travel_date,
                     "ticket_type": _ticket_type,
                 },
@@ -1036,7 +1133,7 @@ JSON:"""
         _avail_triggers = {"train", "trains", "service", "services", "run from", "runs from",
                            "schedule", "timetable", "available", "availability"}
         if any(kw in _lower for kw in _avail_triggers):
-            o, d = _station_ids[0].upper(), _station_ids[1].upper()
+            o, d = _station_ids_unique[0], _station_ids_unique[1]
             _params = {"origin_id": o, "destination_id": d}
             if _travel_date:
                 _params["travel_date"] = _travel_date
@@ -1066,7 +1163,8 @@ JSON:"""
 
         # Clean optional empty values produced by small local models.
         optional_params = {
-            "make_booking": {"ticket_type", "payment_instrument_id"},
+            "make_booking": {"seat_id", "ticket_type", "payment_instrument_id"},
+            "make_booking_by_route": {"seat_id", "ticket_type", "payment_instrument_id"},
             "buy_metro_ticket": {"ticket_type", "payment_instrument_id"},
             "get_feedback": {"journey_id"},
             "get_my_login_history": {"limit"},
@@ -1083,12 +1181,18 @@ JSON:"""
         params = cleaned_params
 
         if tool_name == "make_booking":
-            if not params.get("seat_id") and any(kw in _lower for kw in ["any available seat", "any seat", "pick any"]):
+            if not params.get("seat_id"):
                 params["seat_id"] = "any"
             if params.get("ticket_type") == "return" and not any(kw in _lower for kw in ["return", "round-trip", "round trip"]):
                 params["ticket_type"] = "single"
 
-        if tool_name in {"make_booking", "buy_metro_ticket"} and params.get("payment_instrument_id"):
+        if tool_name == "make_booking_by_route":
+            if not params.get("seat_id"):
+                params["seat_id"] = "any"
+            if params.get("ticket_type") == "return" and not any(kw in _lower for kw in ["return", "round-trip", "round trip"]):
+                params["ticket_type"] = "single"
+
+        if tool_name in {"make_booking", "make_booking_by_route", "buy_metro_ticket"} and params.get("payment_instrument_id"):
             _payment_id_text = str(params["payment_instrument_id"]).upper()
             _payment_was_requested = any(
                 kw in _lower

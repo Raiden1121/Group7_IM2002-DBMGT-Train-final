@@ -902,6 +902,101 @@ def query_my_login_audit(user_id: str, limit: int = 10) -> list[dict]:
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
 
+# Create a rail booking from route details when the user does not know schedule_id.
+def execute_booking_by_route(
+    user_id: str,
+    origin_station_id: str,
+    destination_station_id: str,
+    travel_date: str,
+    fare_class: str,
+    seat_id: str = "any",
+    ticket_type: str = "single",
+    payment_instrument_id: str | None = None,
+) -> tuple[bool, dict | str]:
+    """
+    Resolve a national rail route booking to a concrete schedule, then reuse execute_booking().
+    """
+    user_id = user_id.strip()
+    origin_station_id = origin_station_id.strip().upper()
+    destination_station_id = destination_station_id.strip().upper()
+    travel_date = travel_date.strip()
+    fare_class = fare_class.strip().lower()
+    seat_id = seat_id.strip() if seat_id else "any"
+    ticket_type = ticket_type.strip().lower()
+    payment_instrument_id = payment_instrument_id.strip() if payment_instrument_id else None
+    if payment_instrument_id and payment_instrument_id.lower() in {"null", "none"}:
+        payment_instrument_id = None
+
+    sql = """
+        SELECT
+            s.schedule_id,
+            s.first_train_time,
+            o.stop_order AS origin_stop_order,
+            d.stop_order AS destination_stop_order
+        FROM national_rail_schedules s
+        JOIN national_rail_schedule_stops o
+          ON o.schedule_id = s.schedule_id
+        JOIN national_rail_schedule_stops d
+          ON d.schedule_id = s.schedule_id
+        JOIN national_rail_fare_classes f
+          ON f.schedule_id = s.schedule_id
+         AND f.fare_class = %s
+        WHERE o.station_id = %s
+          AND d.station_id = %s
+          AND o.stop_order < d.stop_order
+        ORDER BY s.first_train_time, s.schedule_id
+    """
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (fare_class, origin_station_id, destination_station_id))
+            schedules = [_to_jsonable(row) for row in cur.fetchall()]
+
+    if not schedules:
+        return False, "No national rail schedule serves this route with the requested fare class."
+
+    if seat_id.lower() != "any":
+        for schedule in schedules:
+            ok, data = execute_booking(
+                user_id=user_id,
+                schedule_id=schedule["schedule_id"],
+                origin_station_id=origin_station_id,
+                destination_station_id=destination_station_id,
+                travel_date=travel_date,
+                fare_class=fare_class,
+                seat_id=seat_id,
+                ticket_type=ticket_type,
+                payment_instrument_id=payment_instrument_id,
+            )
+            if ok:
+                return ok, data
+        return False, "Selected seat is not available on any matching schedule."
+
+    for schedule in schedules:
+        available = query_available_seats(
+            schedule_id=schedule["schedule_id"],
+            travel_date=travel_date,
+            fare_class=fare_class,
+        )
+        selected = auto_select_adjacent_seats(available, 1)
+        if not selected:
+            continue
+        ok, data = execute_booking(
+            user_id=user_id,
+            schedule_id=schedule["schedule_id"],
+            origin_station_id=origin_station_id,
+            destination_station_id=destination_station_id,
+            travel_date=travel_date,
+            fare_class=fare_class,
+            seat_id=selected[0],
+            ticket_type=ticket_type,
+            payment_instrument_id=payment_instrument_id,
+        )
+        if ok:
+            return ok, data
+
+    return False, "No available seats for this route, date, and fare class."
+
+
 # [NEW] 申請預鎖座位 (業務排他鎖)
 def execute_lock_seat(
     user_id: str,
