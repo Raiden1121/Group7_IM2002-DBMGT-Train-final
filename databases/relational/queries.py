@@ -519,14 +519,14 @@ def query_user_bookings(user_email: str) -> dict:
 # Look up the latest payment transaction for one rail booking or metro trip.
 def query_payment_info(booking_id: str, user_id: str | None = None) -> Optional[dict]:
     """Return the latest payment record for a single booking or metro trip."""
-    booking_id = booking_id.strip()
+    booking_id = booking_id.strip().upper()
     sql = """
         SELECT
             pt.payment_id,
             CASE WHEN to_tbl.network_type = 'national_rail' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS booking_id,
             CASE WHEN to_tbl.network_type = 'metro' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS metro_trip_id,
             pt.amount_usd,
-            COALESCE(pi.method_type, 'credit_card') AS method,
+            COALESCE(pi.method_type, 'unspecified') AS method,
             pt.payment_status AS status,
             pt.processed_at AS paid_at
         FROM payment_transactions pt
@@ -688,7 +688,7 @@ def query_feedback(user_id: str, journey_id: str | None = None) -> list[dict]:
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
-# Buy a metro ticket and record the matching payment transaction.
+# Buy a metro ticket and create a pending payment transaction.
 def buy_metro_ticket(
     user_id: str,
     schedule_id: str,
@@ -698,14 +698,16 @@ def buy_metro_ticket(
     ticket_type: str = "single",
     payment_instrument_id: str | None = None,
 ) -> tuple[bool, dict | str]:
-    """Create a metro trip for an active user and charge the selected payment method."""
+    """Create a metro trip for an active user and defer payment completion."""
     user_id = user_id.strip()
-    schedule_id = schedule_id.strip()
-    origin_station_id = origin_station_id.strip()
-    destination_station_id = destination_station_id.strip()
+    schedule_id = schedule_id.strip().upper()
+    origin_station_id = origin_station_id.strip().upper()
+    destination_station_id = destination_station_id.strip().upper()
     travel_date = travel_date.strip()
     ticket_type = ticket_type.strip().lower()
     payment_instrument_id = payment_instrument_id.strip() if payment_instrument_id else None
+    if payment_instrument_id and payment_instrument_id.lower() in {"null", "none"}:
+        payment_instrument_id = None
 
     if ticket_type not in {"single", "day_pass"}:
         return False, "Metro ticket type must be single or day_pass."
@@ -771,23 +773,20 @@ def buy_metro_ticket(
                     return False, "Metro fare information not found."
                 amount_usd = float(fare["total_fare_usd"])
 
-            if not payment_instrument_id:
-                conn.rollback()
-                return False, "No active saved payment method selected. Please add or choose a payment method before buying a ticket."
-
-            cur.execute(
-                """
-                SELECT payment_instrument_id
-                FROM payment_instruments
-                WHERE payment_instrument_id = %s
-                  AND user_id = %s
-                  AND is_active = TRUE
-                """,
-                (payment_instrument_id, user_id),
-            )
-            if not cur.fetchone():
-                conn.rollback()
-                return False, "Payment instrument not found or inactive for this user."
+            if payment_instrument_id:
+                cur.execute(
+                    """
+                    SELECT payment_instrument_id
+                    FROM payment_instruments
+                    WHERE payment_instrument_id = %s
+                      AND user_id = %s
+                      AND is_active = TRUE
+                    """,
+                    (payment_instrument_id, user_id),
+                )
+                if not cur.fetchone():
+                    conn.rollback()
+                    return False, "Payment instrument not found or inactive for this user."
 
             trip_id = _gen_unique_metro_trip_id(cur)
             payment_id = _gen_unique_payment_id(cur)
@@ -829,7 +828,7 @@ def buy_metro_ticket(
                     "charge",
                     amount_usd,
                     "USD",
-                    "paid",
+                    "pending",
                 ),
             )
             conn.commit()
@@ -846,7 +845,7 @@ def buy_metro_ticket(
                 "stops_travelled": route["stops_travelled"],
                 "amount_usd": amount_usd,
                 "status": "completed",
-                "payment_status": "paid",
+                "payment_status": "pending",
             }
     except psycopg2.errors.UniqueViolation as e:
         conn.rollback()
@@ -888,7 +887,7 @@ def query_my_login_audit(user_id: str, limit: int = 10) -> list[dict]:
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
 
-# Create a rail booking and record a paid charge transaction.
+# Create a rail booking and record a pending charge transaction.
 def execute_booking(
     user_id: str,
     schedule_id: str,
@@ -901,7 +900,7 @@ def execute_booking(
     payment_instrument_id: str | None = None,
 ) -> tuple[bool, dict | str]:
     """
-    Create a national rail booking for a logged-in user and record payment.
+    Create a national rail booking for a logged-in user and defer payment completion.
 
     Args:
         user_id:                e.g. "RU01" — must match the logged-in user
@@ -912,16 +911,16 @@ def execute_booking(
         fare_class:             "standard" or "first"
         seat_id:                e.g. "B05" (or "any" to auto-assign)
         ticket_type:            "single" (default) or "return"
-        payment_instrument_id:  required saved payment method owned by the user
+        payment_instrument_id:  optional saved payment method owned by the user
 
     Returns:
         (True, booking_dict)   on success
         (False, error_message) on failure
     """
     user_id = user_id.strip()
-    schedule_id = schedule_id.strip()
-    origin_station_id = origin_station_id.strip()
-    destination_station_id = destination_station_id.strip()
+    schedule_id = schedule_id.strip().upper()
+    origin_station_id = origin_station_id.strip().upper()
+    destination_station_id = destination_station_id.strip().upper()
     travel_date = travel_date.strip()
     seat_id = seat_id.strip()
     if seat_id.lower() != "any":
@@ -929,6 +928,8 @@ def execute_booking(
     fare_class = fare_class.strip().lower()
     ticket_type = ticket_type.strip().lower()
     payment_instrument_id = payment_instrument_id.strip() if payment_instrument_id else None
+    if payment_instrument_id and payment_instrument_id.lower() in {"null", "none"}:
+        payment_instrument_id = None
 
     conn = psycopg2.connect(PG_DSN)
     conn.autocommit = False
@@ -1038,23 +1039,20 @@ def execute_booking(
                 conn.rollback()
                 return False, "Fare information not found."
 
-            if not payment_instrument_id:
-                conn.rollback()
-                return False, "No active saved payment method selected. Please add or choose a payment method before booking."
-
-            cur.execute(
-                """
-                SELECT payment_instrument_id
-                FROM payment_instruments
-                WHERE payment_instrument_id = %s
-                  AND user_id = %s
-                  AND is_active = TRUE
-                """,
-                (payment_instrument_id, user_id),
-            )
-            if not cur.fetchone():
-                conn.rollback()
-                return False, "Payment instrument not found or inactive for this user."
+            if payment_instrument_id:
+                cur.execute(
+                    """
+                    SELECT payment_instrument_id
+                    FROM payment_instruments
+                    WHERE payment_instrument_id = %s
+                      AND user_id = %s
+                      AND is_active = TRUE
+                    """,
+                    (payment_instrument_id, user_id),
+                )
+                if not cur.fetchone():
+                    conn.rollback()
+                    return False, "Payment instrument not found or inactive for this user."
 
             booking_id = _gen_unique_booking_id(cur)
             payment_id = _gen_unique_payment_id(cur)
@@ -1101,7 +1099,7 @@ def execute_booking(
                     "charge",
                     fare["total_fare_usd"],
                     "USD",
-                    "paid",
+                    "pending",
                 ),
             )
             conn.commit()
@@ -1123,7 +1121,7 @@ def execute_booking(
                 "stops_travelled": route["stops_travelled"],
                 "amount_usd": fare["total_fare_usd"],
                 "status": "confirmed",
-                "payment_status": "paid",
+                "payment_status": "pending",
             }
     except psycopg2.errors.UniqueViolation as e:
         conn.rollback()

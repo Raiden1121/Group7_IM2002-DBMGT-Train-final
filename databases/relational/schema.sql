@@ -1140,7 +1140,7 @@ SELECT
     CASE WHEN to_tbl.network_type = 'national_rail' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS booking_id,
     CASE WHEN to_tbl.network_type = 'metro' THEN SUBSTRING(pt.order_id FROM 5) ELSE NULL END AS metro_trip_id,
     pt.amount_usd,
-    COALESCE(pi.method_type, 'credit_card') AS method,
+    COALESCE(pi.method_type, 'unspecified') AS method,
     pt.payment_status AS status,
     pt.processed_at AS paid_at
 FROM payment_transactions pt

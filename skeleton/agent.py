@@ -206,7 +206,7 @@ TOOLS = [
         "description": (
             "Create a national rail booking for the logged-in user. "
             "REQUIRES LOGIN. Only call after the user has explicitly confirmed all booking details. "
-            "Requires an active saved payment method ID. Do NOT call this speculatively."
+            "If payment is omitted, create the booking with pending payment. Do NOT call this speculatively."
         ),
         "parameters": {
             "schedule_id":            {"type": "string", "description": "e.g. NR_SCH01"},
@@ -216,7 +216,7 @@ TOOLS = [
             "fare_class":             {"type": "string", "description": "standard or first"},
             "seat_id":                {"type": "string", "description": "Specific seat ID (e.g. B05) or 'any' for auto-assign"},
             "ticket_type":            {"type": "string", "description": "single or return (default single)"},
-            "payment_instrument_id":  {"type": "string", "description": "Required active saved payment method ID"},
+            "payment_instrument_id":  {"type": "string", "description": "Optional saved payment method ID. If omitted, create booking with pending payment."},
         },
         "required": ["schedule_id", "origin_station_id", "destination_station_id", "travel_date", "fare_class", "seat_id"],
     },
@@ -348,7 +348,7 @@ TOOLS = [
         "description": (
             "Create a new metro ticket purchase for the logged-in user. "
             "Use when the user says buy, purchase, book, or get a metro single ticket/day pass and provides schedule, origin, destination, and travel date. "
-            "Requires an active saved payment method ID. Do not use check_metro_availability for confirmed purchase requests."
+            "If payment is omitted, create the ticket with pending payment. Do not use check_metro_availability for confirmed purchase requests."
         ),
         "parameters": {
             "schedule_id": {"type": "string", "description": "e.g. MS_SCH01"},
@@ -356,7 +356,7 @@ TOOLS = [
             "destination_station_id": {"type": "string", "description": "Metro station ID e.g. MS04"},
             "travel_date": {"type": "string", "description": "YYYY-MM-DD"},
             "ticket_type": {"type": "string", "description": "single or day_pass"},
-            "payment_instrument_id": {"type": "string", "description": "Required active saved payment method ID"},
+            "payment_instrument_id": {"type": "string", "description": "Optional saved payment method ID. If omitted, create ticket with pending payment."},
         },
         "required": ["schedule_id", "origin_station_id", "destination_station_id", "travel_date"],
     },
@@ -788,7 +788,7 @@ get_payment_info: call with booking_id when user asks payment status, payment me
 get_user_payment_methods: call when logged-in user asks for saved cards, wallets, or payment methods.
 submit_feedback: call when logged-in user gives a new rating, stars, review, or comment for a booking/trip.
 get_feedback: read-only; call when logged-in user asks to show/list/view/check feedback they have submitted. Never pass rating/comment to get_feedback.
-buy_metro_ticket: call when logged-in user wants to buy, purchase, book, or get a metro ticket/day pass and provides schedule, stations, date, and payment method ID.
+buy_metro_ticket: call when logged-in user wants to buy, purchase, book, or get a metro ticket/day pass and provides schedule, stations, and date. Payment method ID is optional; omit it for pending payment.
 get_my_login_history: call when logged-in user asks about recent login history or audit records.
 make_booking/cancel_booking: only if user is logged in.
 Route/path/journey questions: use find_route. Policy questions: use search_policy.
@@ -830,7 +830,7 @@ JSON:"""
                 "get_feedback is read-only; never call get_feedback with rating/comment params. "
                 "Show/list/view/check feedback the user has submitted → get_feedback. "
                 "Recent login history/audit → get_my_login_history. "
-                "Buy/purchase/book/get a metro ticket or day pass with schedule, stations, date, and payment method ID → buy_metro_ticket. "
+                "Buy/purchase/book/get a metro ticket or day pass with schedule, stations, and date → buy_metro_ticket. "
                 "Do not use check_metro_availability for confirmed metro purchase requests. "
                 "Book a ticket / make a booking → check_national_rail_availability first, then make_booking. "
                 "Cancel a booking → cancel_booking. "
@@ -885,13 +885,43 @@ JSON:"""
         any(kw in _lower for kw in _route_triggers) or
         (_two_stations and "route" in _lower)
     )
+    _booking_triggers = {"book", "booking", "reserve", "reservation"}
+    _rail_schedule_match = re.search(r'\bNR_SCH\d{2}\b', _augmented_message, re.IGNORECASE)
+    _is_rail_booking = (
+        any(kw in _lower for kw in _booking_triggers)
+        and (_rail_schedule_match or "national rail" in _lower)
+    )
     if _is_route and _two_stations and not _tool_selected("find_route", "origin_id", "destination_id"):
         _opt = "cost" if any(kw in _lower for kw in ["cheap", "cheapest", "lowest cost"]) else "time"
         _fallback("find_route",
                   {"origin_id": _station_ids[0].upper(), "destination_id": _station_ids[1].upper(), "optimise_by": _opt},
                   "route query")
 
-    # 2. Metro ticket purchase — keeps confirmed purchases out of availability fallback
+    # 2. National rail booking — overrides fare/availability misroutes for confirmed booking intent
+    elif (
+        _two_stations
+        and _is_rail_booking
+        and _rail_schedule_match
+        and _travel_date
+        and not _tool_selected("make_booking", "schedule_id", "origin_station_id", "destination_station_id", "travel_date", "fare_class", "seat_id")
+    ):
+        _seat_match = re.search(r'\b[A-Z]\d{2}\b', _augmented_message)
+        _ticket_type = "return" if any(kw in _lower for kw in ["return", "round-trip", "round trip"]) else "single"
+        _fallback(
+            "make_booking",
+            {
+                "schedule_id": _rail_schedule_match.group(0).upper(),
+                "origin_station_id": _station_ids[0].upper(),
+                "destination_station_id": _station_ids[1].upper(),
+                "travel_date": _travel_date,
+                "fare_class": "first" if "first" in _lower else "standard",
+                "seat_id": _seat_match.group(0).upper() if _seat_match else "any",
+                "ticket_type": _ticket_type,
+            },
+            "national rail booking query",
+        )
+
+    # 3. Metro ticket purchase — keeps confirmed purchases out of availability fallback
     elif not tool_calls and _two_stations:
         _purchase_triggers = {"buy", "purchase", "book", "get me", "get a", "ticket", "day pass"}
         _is_metro_purchase = (
@@ -914,7 +944,7 @@ JSON:"""
                 "metro ticket purchase query",
             )
 
-    # 3. Availability / trains / schedules between two stations
+    # 4. Availability / trains / schedules between two stations
     elif not tool_calls and _two_stations:
         _avail_triggers = {"train", "trains", "service", "services", "run from", "runs from",
                            "schedule", "timetable", "available", "availability"}
@@ -947,7 +977,40 @@ JSON:"""
         tool_name = call.get("name", "")
         params    = call.get("params") or call.get("parameters", {})
 
-        # Skip calls with empty string values — LLM failed to extract params
+        # Clean optional empty values produced by small local models.
+        optional_params = {
+            "make_booking": {"ticket_type", "payment_instrument_id"},
+            "buy_metro_ticket": {"ticket_type", "payment_instrument_id"},
+            "get_feedback": {"journey_id"},
+            "get_my_login_history": {"limit"},
+        }
+        cleaned_params = {}
+        for key, value in params.items():
+            if isinstance(value, str):
+                value = value.strip()
+                if value.lower() in {"null", "none"}:
+                    value = ""
+            if value == "" and key in optional_params.get(tool_name, set()):
+                continue
+            cleaned_params[key] = value
+        params = cleaned_params
+
+        if tool_name == "make_booking":
+            if not params.get("seat_id") and any(kw in _lower for kw in ["any available seat", "any seat", "pick any"]):
+                params["seat_id"] = "any"
+            if params.get("ticket_type") == "return" and not any(kw in _lower for kw in ["return", "round-trip", "round trip"]):
+                params["ticket_type"] = "single"
+
+        if tool_name in {"make_booking", "buy_metro_ticket"} and params.get("payment_instrument_id"):
+            _payment_id_text = str(params["payment_instrument_id"]).upper()
+            _payment_was_requested = any(
+                kw in _lower
+                for kw in ["payment instrument", "payment method", "using payment", "with payment", "using card", "credit card", "debit card", "ewallet"]
+            )
+            if not _payment_was_requested and not _payment_id_text.startswith(("PMI-", "PI")):
+                params.pop("payment_instrument_id", None)
+
+        # Skip calls with remaining empty required values — LLM failed to extract params
         if any(v == "" for v in params.values()):
             if debug:
                 debug_info.append(f"**Skipped** `{tool_name}` — empty params: {params}")
