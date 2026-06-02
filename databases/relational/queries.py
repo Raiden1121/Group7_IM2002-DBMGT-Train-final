@@ -364,12 +364,14 @@ def query_available_seats(
             seats.coach,
             seats.seat_row AS row,
             seats.seat_column AS column,
-            seats.fare_class
+            seats.fare_class,
+            seats.seat_pk
         FROM national_rail_seat_layouts layouts
         JOIN national_rail_seats seats
           ON seats.layout_id = layouts.layout_id
         WHERE layouts.schedule_id = %s
           AND seats.fare_class = %s
+          -- 排除已正式訂票且確認/完成的座位 (Confirmed Bookings)
           AND NOT EXISTS (
               SELECT 1
               FROM national_rail_bookings b
@@ -379,11 +381,24 @@ def query_available_seats(
                 AND b.seat_id = seats.seat_id
                 AND b.status IN ('confirmed', 'completed')
           )
+          -- 排除正被他人臨時預鎖且未過期的座位 (Active seat locks)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM seat_locks l
+              WHERE l.schedule_id = %s
+                AND l.travel_date = %s
+                AND l.seat_pk = seats.seat_pk
+                AND l.status = 'pending'
+                AND l.expires_at > NOW()
+          )
         ORDER BY seats.coach, seats.seat_row, seats.seat_column
+        -- 套用資料庫共享鎖 (S-Lock)，保護查詢期間的座位物理佈局不被修改，但允許多個用戶並行查詢
+        FOR SHARE OF seats;
     """
     with _connect() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(sql, (schedule_id, fare_class, schedule_id, travel_date))
+            # 傳入參數：[layouts.schedule_id, seats.fare_class, b.schedule_id, b.travel_date, l.schedule_id, l.travel_date]
+            cur.execute(sql, (schedule_id, fare_class, schedule_id, travel_date, schedule_id, travel_date))
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
@@ -887,6 +902,145 @@ def query_my_login_audit(user_id: str, limit: int = 10) -> list[dict]:
 
 # ── TRANSACTIONAL OPERATIONS ──────────────────────────────────────────────────
 
+# [NEW] 申請預鎖座位 (業務排他鎖)
+def execute_lock_seat(
+    user_id: str,
+    schedule_id: str,
+    travel_date: str,
+    seat_id: str,
+) -> tuple[bool, str]:
+    """
+    嘗試獲取業務排他鎖 (10 分鐘座位預鎖)。
+    1. 執行過期鎖清除的垃圾回收。
+    2. 檢查座位是否存在，並透過 SELECT ... FOR UPDATE 獲得列級鎖防止併發衝擊。
+    3. 驗證該座位當前沒有被正式預訂。
+    4. 生成唯一的隨機 LK 鎖編號，嘗試 INSERT。若捕獲 UniqueViolation，說明該座位已被他人鎖定。
+    """
+    user_id = user_id.strip()
+    schedule_id = schedule_id.strip().upper()
+    travel_date = travel_date.strip()
+    seat_id = seat_id.strip().upper()
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1. 垃圾回收：自動清理過期的 pending 臨時鎖以保持資料表整潔
+            cur.execute("DELETE FROM seat_locks WHERE expires_at <= NOW();")
+
+            # 2. 獲取該座位的物理 seat_pk
+            cur.execute(
+                """
+                SELECT s.seat_pk
+                FROM national_rail_seat_layouts l
+                JOIN national_rail_seats s ON s.layout_id = l.layout_id
+                WHERE l.schedule_id = %s AND s.seat_id = %s
+                """,
+                (schedule_id, seat_id)
+            )
+            seat = cur.fetchone()
+            if not seat:
+                conn.rollback()
+                return False, "Seat not found for the selected schedule."
+            seat_pk = seat["seat_pk"]
+
+            # 3. 獲取資料庫級排他鎖 (X-Lock)，保證高併發插入時的併發安全性
+            cur.execute("SELECT 1 FROM seat_layout_seats WHERE seat_pk = %s FOR UPDATE;", (seat_pk,))
+
+            # 4. 檢查座位是否已經被正式訂票 (Confirmed Booking)
+            cur.execute(
+                """
+                SELECT 1
+                FROM national_rail_bookings b
+                JOIN national_rail_seats seats ON seats.coach = b.coach AND seats.seat_id = b.seat_id
+                JOIN national_rail_seat_layouts layouts ON layouts.layout_id = seats.layout_id
+                WHERE layouts.schedule_id = %s
+                  AND b.travel_date = %s
+                  AND seats.seat_pk = %s
+                  AND b.status IN ('confirmed', 'completed')
+                """,
+                (schedule_id, travel_date, seat_pk)
+            )
+            if cur.fetchone():
+                conn.rollback()
+                return False, "Selected seat is already booked."
+
+            # 5. 確保該座位沒有被其他人的有效 pending 鎖佔用
+            cur.execute(
+                """
+                SELECT 1 FROM seat_locks
+                WHERE schedule_id = %s
+                  AND travel_date = %s
+                  AND seat_pk = %s
+                  AND status = 'pending'
+                  AND expires_at > NOW()
+                """,
+                (schedule_id, travel_date, seat_pk)
+            )
+            if cur.fetchone():
+                conn.rollback()
+                return False, "該座位正在被其他人挑選中，請稍候"
+
+            # 6. 生成唯一鎖編號並插入臨時鎖記錄 (自動透過 Trigger 設定 10 分鐘過期)
+            while True:
+                suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+                lock_id = f"LK-{suffix}"
+                cur.execute("SELECT 1 FROM seat_locks WHERE lock_id = %s", (lock_id,))
+                if not cur.fetchone():
+                    break
+
+            cur.execute(
+                """
+                INSERT INTO seat_locks (lock_id, user_id, schedule_id, travel_date, seat_pk, status)
+                VALUES (%s, %s, %s, %s, %s, 'pending')
+                """,
+                (lock_id, user_id, schedule_id, travel_date, seat_pk)
+            )
+            conn.commit()
+            return True, lock_id
+
+    except psycopg2.errors.UniqueViolation as e:
+        conn.rollback()
+        # 捕獲唯一性衝突，代表該座位正被其他人臨時預鎖中
+        return False, "該座位正在被其他人挑選中，請稍候"
+    except Exception as e:
+        conn.rollback()
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+# [NEW] 手動釋放座位鎖 (使用者放棄預訂流程時主動調用)
+def execute_release_seat(lock_id: str, user_id: str) -> bool:
+    """
+    手動釋放座位鎖。
+    當用戶主動取消付款或返回上一頁時，將該臨時鎖狀態標記為 released 或直接刪除以釋放資源。
+    """
+    lock_id = lock_id.strip()
+    user_id = user_id.strip()
+
+    conn = psycopg2.connect(PG_DSN)
+    conn.autocommit = False
+    try:
+        with conn.cursor() as cur:
+            # 刪除該用戶對應的 pending 狀態臨時鎖
+            cur.execute(
+                """
+                DELETE FROM seat_locks
+                WHERE lock_id = %s AND user_id = %s AND status = 'pending'
+                """,
+                (lock_id, user_id)
+            )
+            released = cur.rowcount > 0
+            conn.commit()
+            return released
+    except Exception:
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
 # Create a rail booking and record a pending charge transaction.
 def execute_booking(
     user_id: str,
@@ -992,7 +1146,9 @@ def execute_booking(
 
             selected_seat_id = seat_id
             selected_coach = None
+            selected_seat_pk = None
             if seat_id.lower() == "any":
+                # query_available_seats 會帶有 FOR SHARE S-Lock，保證讀取期間不會發生配置修改
                 available = query_available_seats(schedule_id, travel_date, fare_class)
                 if not available:
                     conn.rollback()
@@ -1000,10 +1156,11 @@ def execute_booking(
                 selected = available[0]
                 selected_seat_id = selected["seat_id"]
                 selected_coach = selected["coach"]
+                selected_seat_pk = selected["seat_pk"]
             else:
                 cur.execute(
                     """
-                    SELECT coach, seat_id, fare_class
+                    SELECT coach, seat_id, fare_class, seat_pk
                     FROM national_rail_seats
                     WHERE layout_id = %s
                       AND seat_id = %s
@@ -1017,22 +1174,49 @@ def execute_booking(
                 if seat["fare_class"] != fare_class:
                     conn.rollback()
                     return False, "Selected seat does not match the requested fare class."
-                cur.execute(
-                    """
-                    SELECT 1
-                    FROM national_rail_bookings
-                    WHERE schedule_id = %s
-                      AND travel_date = %s
-                      AND coach = %s
-                      AND seat_id = %s
-                      AND status IN ('confirmed', 'completed')
-                    """,
-                    (schedule_id, travel_date, seat["coach"], seat["seat_id"]),
-                )
-                if cur.fetchone():
-                    conn.rollback()
-                    return False, "Selected seat is already booked."
                 selected_coach = seat["coach"]
+                selected_seat_pk = seat["seat_pk"]
+
+            # 1. 套用資料庫列級排他鎖 (X-Lock / FOR UPDATE)，阻止其他交易同時對該座位進行 booking
+            cur.execute(
+                "SELECT 1 FROM seat_layout_seats WHERE seat_pk = %s FOR UPDATE;",
+                (selected_seat_pk,)
+            )
+
+            # 2. 驗證該座位當前沒有被正式預訂 (防禦 Race Condition)
+            cur.execute(
+                """
+                SELECT 1
+                FROM national_rail_bookings
+                WHERE schedule_id = %s
+                  AND travel_date = %s
+                  AND coach = %s
+                  AND seat_id = %s
+                  AND status IN ('confirmed', 'completed')
+                """,
+                (schedule_id, travel_date, selected_coach, selected_seat_id),
+            )
+            if cur.fetchone():
+                conn.rollback()
+                return False, "Selected seat is already booked."
+
+            # 3. 確保該座位沒有被「其他用戶」的有效 pending 臨時鎖佔用
+            cur.execute(
+                """
+                SELECT user_id 
+                FROM seat_locks 
+                WHERE schedule_id = %s 
+                  AND travel_date = %s 
+                  AND seat_pk = %s 
+                  AND status = 'pending' 
+                  AND expires_at > NOW()
+                """,
+                (schedule_id, travel_date, selected_seat_pk)
+            )
+            active_lock = cur.fetchone()
+            if active_lock and active_lock["user_id"] != user_id:
+                conn.rollback()
+                return False, "該座位已被其他使用者臨時預鎖，請選擇其他座位"
 
             fare = query_national_rail_fare(schedule_id, fare_class, route["stops_travelled"])
             if not fare:
@@ -1102,6 +1286,21 @@ def execute_booking(
                     "pending",
                 ),
             )
+
+            # 4. 鎖轉移 (Lock Transfer)：若當前用戶擁有該座位的臨時鎖，將其 pending 鎖升級/更新為 confirmed
+            cur.execute(
+                """
+                UPDATE seat_locks
+                SET status = 'confirmed'
+                WHERE user_id = %s
+                  AND schedule_id = %s
+                  AND travel_date = %s
+                  AND seat_pk = %s
+                  AND status = 'pending'
+                """,
+                (user_id, schedule_id, travel_date, selected_seat_pk)
+            )
+
             conn.commit()
             return True, {
                 "booking_id": booking_id,

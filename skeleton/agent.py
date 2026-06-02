@@ -53,6 +53,8 @@ from databases.relational.queries import (
     query_my_login_audit,
     execute_booking,
     execute_cancellation,
+    execute_lock_seat,
+    execute_release_seat,
     query_policy_vector_search,
 )
 from databases.graph.queries import (
@@ -371,6 +373,31 @@ TOOLS = [
         },
         "required": [],
     },
+    {
+        "name": "lock_seat",
+        "description": (
+            "Temporarily lock/reserve a national rail seat for 10 minutes before payment. "
+            "Use when the user selects a specific seat (e.g. A01) but has not paid yet, "
+            "or wants to reserve a seat temporarily. REQUIRES LOGIN."
+        ),
+        "parameters": {
+            "schedule_id":  {"type": "string", "description": "e.g. NR_SCH01"},
+            "travel_date":  {"type": "string", "description": "YYYY-MM-DD"},
+            "seat_id":      {"type": "string", "description": "Specific seat ID e.g. A01"},
+        },
+        "required": ["schedule_id", "travel_date", "seat_id"],
+    },
+    {
+        "name": "release_seat",
+        "description": (
+            "Release a temporarily locked seat manually when the user decides to cancel their pre-booking. "
+            "Use when the user changes their mind or cancels the booking session. REQUIRES LOGIN."
+        ),
+        "parameters": {
+            "lock_id":      {"type": "string", "description": "The lock reference e.g. LK-XXXXXX"},
+        },
+        "required": ["lock_id"],
+    },
 ]
 
 TOOLS_SCHEMA = """\
@@ -392,7 +419,9 @@ buy_metro_ticket(schedule_id, origin_station_id, destination_station_id, travel_
 get_my_login_history(limit?)
 search_policy(query)
 find_alternative_routes(origin_id, destination_id, avoid_station_id, network?)
-get_delay_ripple(station_id, hops?)"""
+get_delay_ripple(station_id, hops?)
+lock_seat(schedule_id, travel_date, seat_id)
+release_seat(lock_id)"""
 
 
 # Added tool schema entries for payment, feedback, metro purchase, and login audit.
@@ -639,6 +668,32 @@ def _execute_tool(
                 delayed_station_id=params["station_id"],
                 hops=params.get("hops", 2),
             )
+
+        elif tool_name == "lock_seat":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to lock a seat."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            ok, data = execute_lock_seat(
+                user_id=profile["user_id"],
+                schedule_id=params["schedule_id"],
+                travel_date=params["travel_date"],
+                seat_id=params["seat_id"],
+            )
+            result = {"status": "success", "lock_id": data, "message": "Seat locked for 10 minutes."} if ok else {"error": data}
+
+        elif tool_name == "release_seat":
+            if not current_user_email:
+                return json.dumps({"error": "You must be logged in to release a seat."})
+            profile = query_user_profile(current_user_email)
+            if not profile:
+                return json.dumps({"error": "User profile not found."})
+            released = execute_release_seat(
+                lock_id=params["lock_id"],
+                user_id=profile["user_id"],
+            )
+            result = {"status": "success", "message": "Seat lock released successfully."} if released else {"error": "Failed to release lock or lock not found."}
 
         else:
             result = {"error": f"Unknown tool: {tool_name}"}
