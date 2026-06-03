@@ -7,6 +7,11 @@ Then open: http://localhost:7860
 Students: You do NOT need to change this file.
 """
 
+# TASK 6 EXTENSION:
+# This file includes UI entry points for Task 6 pending payment confirmation,
+# cancellation, and Google OAuth account mapping backed by database operations.
+# Detailed comments are placed near the affected UI handlers.
+
 import sys
 sys.path.insert(0, ".")
 
@@ -209,6 +214,15 @@ GOOGLE_BUTTON_CSS = """
     border-radius: 8px;
     padding: 12px;
 }
+
+#pending_orders_table table {
+    min-width: 940px;
+}
+
+#pending_orders_table th,
+#pending_orders_table td {
+    white-space: nowrap;
+}
 """
 
 GOOGLE_SIGNIN_BUTTON_HTML = """
@@ -295,6 +309,8 @@ def _display_order_id(order_id: str) -> str:
     return order_id[4:] if order_id.startswith("ORD-") else order_id
 
 
+# TASK 6 EXTENSION: Reads pending payment orders from the database and formats
+# them for the payment confirmation panel.
 def _pending_order_updates(user_id: str | None):
     """Build table, dropdown, and status updates for pending orders."""
     if not user_id:
@@ -336,6 +352,8 @@ def refresh_pending_orders(current_user: str | None, request: gr.Request):
     return _pending_order_updates(user_id)
 
 
+# TASK 6 EXTENSION: Confirms a selected pending payment through the database
+# transaction helper.
 def confirm_selected_pending_order(order_id: str | None, current_user: str | None, request: gr.Request):
     """Confirm payment for the selected pending order."""
     user_id = _current_user_id(current_user, request)
@@ -353,6 +371,8 @@ def confirm_selected_pending_order(order_id: str | None, current_user: str | Non
     return rows, select_update, gr.update(value=f"Payment confirmed for {_display_order_id(result['order_id'])}.")
 
 
+# TASK 6 EXTENSION: Cancels a selected pending payment and releases the related
+# booking/trip through the database transaction helper.
 def cancel_selected_pending_order(order_id: str | None, current_user: str | None, request: gr.Request):
     """Cancel the selected pending order and release its reservation."""
     user_id = _current_user_id(current_user, request)
@@ -609,6 +629,8 @@ def forgot_reset_password(email: str, answer: str, new_password: str):
     return gr.update(value="**Password reset successfully. You can now log in.**", visible=True)
 
 
+# TASK 6 EXTENSION: Completes Google OAuth signup by creating the local database
+# user and OAuth mapping.
 def complete_google_registration(year_of_birth: str, request: gr.Request):
     """Finish first-time Google signup after collecting the required birth year."""
     pending_google = None
@@ -810,6 +832,7 @@ with gr.Blocks(title="TransitFlow") as demo:
                 gr.Markdown("### Pending Orders")
                 pending_order_msg = gr.Markdown("Login to view pending booking payments.")
                 pending_orders_table = gr.Dataframe(
+                    elem_id="pending_orders_table",
                     headers=[
                         "Order ID",
                         "Network",
@@ -822,8 +845,9 @@ with gr.Blocks(title="TransitFlow") as demo:
                     datatype=["str", "str", "str", "str", "str", "str", "str"],
                     row_count=0,
                     column_count=7,
+                    column_widths=[120, 130, 260, 120, 120, 130, 120],
                     interactive=False,
-                    wrap=True,
+                    wrap=False,
                     label="Pending booking payments",
                 )
                 pending_order_select = gr.Dropdown(
@@ -1111,6 +1135,8 @@ app.add_middleware(
 
 
 @app.get("/auth/google/login")
+# TASK 6 EXTENSION: Starts Google OAuth login for the database-backed OAuth user
+# mapping flow.
 async def google_login(request: Request):
     """Start Google OAuth login using the configured redirect URI."""
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
@@ -1119,6 +1145,8 @@ async def google_login(request: Request):
 
 
 @app.get("/auth/google/callback")
+# TASK 6 EXTENSION: Handles Google OAuth callback and calls relational account
+# mapping functions.
 async def google_callback(request: Request):
     """Handle Google OAuth callback and either login or start signup completion."""
     try:
@@ -1159,6 +1187,7 @@ async def google_callback(request: Request):
 
 
 @app.get("/auth/logout")
+# TASK 6 EXTENSION: Clears the local session for Google/password users.
 async def google_logout(request: Request):
     """Clear server-side login session and return to the app."""
     request.session.clear()
