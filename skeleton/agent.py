@@ -27,6 +27,11 @@ Your goal is to make the database queries richer by:
 The agent will automatically use whatever you put in the databases.
 """
 
+# TASK 6 EXTENSION:
+# This file registers and dispatches Task 6 assistant tools for seat locking,
+# booking/payment workflows, metro purchases, feedback, and policy search.
+# Detailed comments are placed near the affected tool-dispatch logic.
+
 from __future__ import annotations
 
 import json
@@ -452,6 +457,8 @@ release_seat(lock_id)"""
 # Added tool schema entries for payment, feedback, metro purchase, and login audit.
 # ── Agent logic ───────────────────────────────────────────────────────────────
 
+# TASK 6 EXTENSION: Dispatches Task 6 tools for seat locking, metro purchase,
+# feedback, payment lookup, and policy search to the underlying database code.
 def _execute_tool(
     tool_name: str,
     params: dict,

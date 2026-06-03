@@ -1,5 +1,8 @@
 [
   {
+    "_task6_extension": "TASK 6 EXTENSION: Extended refund policy seed data for pgvector RAG, including force majeure, missed connection, and disruption compensation policies."
+  },
+  {
     "policy_id": "RF001",
     "label": "National Rail – Normal Service – Single or Return",
     "applies_to": {

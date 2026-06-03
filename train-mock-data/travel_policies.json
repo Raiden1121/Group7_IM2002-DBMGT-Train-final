@@ -1,4 +1,5 @@
 {
+  "_task6_extension": "TASK 6 EXTENSION: Extended travel-policy seed data for pgvector RAG, including lost property, accessibility, service animal, and passenger assistance policies.",
   "version": "1.0",
   "last_updated": "2024-01-01",
   "general_policies": {

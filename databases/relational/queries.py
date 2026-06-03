@@ -20,6 +20,11 @@ The vector functions (query_policy_vector_search, store_policy_document)
 are already implemented — do not modify them.
 """
 
+# TASK 6 EXTENSION:
+# This file includes database operations for Task 6 booking holds, pending
+# payments, metro purchases, feedback, Google OAuth mapping, and policy search
+# support. Detailed Task 6 comments are placed next to each affected function.
+
 from __future__ import annotations
 
 import random
@@ -549,6 +554,8 @@ def query_user_bookings(user_email: str) -> dict:
             return {"national_rail": rail_rows, "metro": metro_rows}
 
 
+# TASK 6 EXTENSION: Payment lookup reads payment_transactions for a user's rail
+# booking or metro trip without exposing payment token data.
 # Look up the latest payment transaction for one rail booking or metro trip.
 def query_payment_info(booking_id: str, user_id: str | None = None) -> Optional[dict]:
     """Return the latest payment record for a single booking or metro trip."""
@@ -582,6 +589,8 @@ def query_payment_info(booking_id: str, user_id: str | None = None) -> Optional[
 
 # ── ADDED USER ACCOUNT / METRO / FEEDBACK QUERIES ────────────────────────────
 
+# TASK 6 EXTENSION: Pending payment timeout cleanup releases stale unpaid
+# bookings/trips and their related seat holds.
 # Release expired pending orders and their reservations.
 def cleanup_expired_pending_orders(user_id: str | None = None) -> int:
     """Cancel pending orders whose 10-minute payment window has expired."""
@@ -618,6 +627,8 @@ def cleanup_expired_pending_orders(user_id: str | None = None) -> int:
         conn.close()
 
 
+# TASK 6 EXTENSION: Shared release helper updates booking/trip state, failed
+# payment state, and seat_locks in one transaction.
 # Release one pending order using existing view triggers where possible.
 def _release_pending_order(cur, order_id: str) -> None:
     """Mark a pending order as cancelled/failed and release any active seat hold."""
@@ -695,6 +706,8 @@ def _release_pending_order(cur, order_id: str) -> None:
     )
 
 
+# TASK 6 EXTENSION: Pending-payment query returns unpaid orders and countdown
+# data for the UI confirmation panel.
 # Fetch pending payment orders for one user.
 def query_pending_orders(user_id: str) -> list[dict]:
     """Return pending orders that still need payment confirmation."""
@@ -743,6 +756,8 @@ def query_pending_orders(user_id: str) -> list[dict]:
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
+# TASK 6 EXTENSION: Pending-payment confirmation locks the payment row and marks
+# it paid only if the payment window is still valid.
 # Confirm payment for one pending order owned by the user.
 def confirm_pending_payment(user_id: str, order_id: str) -> tuple[bool, dict | str]:
     """Mark one pending order payment as paid before the hold expires."""
@@ -805,6 +820,8 @@ def confirm_pending_payment(user_id: str, order_id: str) -> tuple[bool, dict | s
         conn.close()
 
 
+# TASK 6 EXTENSION: Pending-payment cancellation releases the order and marks the
+# related payment transaction as failed.
 # Cancel one pending order owned by the user.
 def cancel_pending_order(user_id: str, order_id: str) -> tuple[bool, dict | str]:
     """Cancel one pending order and release its booking or trip."""
@@ -848,6 +865,8 @@ def cancel_pending_order(user_id: str, order_id: str) -> tuple[bool, dict | str]
         conn.close()
 
 
+# TASK 6 EXTENSION: Saved-payment lookup exposes only safe payment method
+# metadata owned by the logged-in user.
 # Fetch active payment methods owned by one user without exposing token data.
 def query_user_payment_methods(user_id: str) -> list[dict]:
     """Return active payment instruments for a user, excluding token_ref."""
@@ -871,6 +890,8 @@ def query_user_payment_methods(user_id: str) -> list[dict]:
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
+# TASK 6 EXTENSION: Feedback submission validates journey ownership and prevents
+# duplicate reviews for the same journey.
 # Submit one feedback record for a journey owned by the user.
 def submit_feedback(
     user_id: str,
@@ -958,6 +979,8 @@ def submit_feedback(
         conn.close()
 
 
+# TASK 6 EXTENSION: Feedback lookup returns only feedback records owned by the
+# logged-in user.
 # Fetch feedback submitted by one user, optionally for a single journey.
 def query_feedback(user_id: str, journey_id: str | None = None) -> list[dict]:
     """Return feedback records owned by the user."""
@@ -989,6 +1012,8 @@ def query_feedback(user_id: str, journey_id: str | None = None) -> list[dict]:
             return [_to_jsonable(row) for row in cur.fetchall()]
 
 
+# TASK 6 EXTENSION: Metro ticket purchase creates a real metro journey and a
+# pending payment transaction for the logged-in user.
 # Buy a metro ticket and create a pending payment transaction.
 def buy_metro_ticket(
     user_id: str,
@@ -1283,6 +1308,8 @@ def execute_booking_by_route(
     return False, "No available seats for this route, date, and fare class."
 
 
+# TASK 6 EXTENSION: Seat locking creates a 10-minute temporary hold and uses
+# database locks/unique constraints to prevent concurrent seat selection.
 # [NEW] 申請預鎖座位 (業務排他鎖)
 def execute_lock_seat(
     user_id: str,
@@ -1391,6 +1418,8 @@ def execute_lock_seat(
         conn.close()
 
 
+# TASK 6 EXTENSION: Seat-lock release lets the user manually release a pending
+# temporary hold before payment.
 # [NEW] 手動釋放座位鎖 (使用者放棄預訂流程時主動調用)
 def execute_release_seat(lock_id: str, user_id: str) -> bool:
     """
@@ -1422,6 +1451,8 @@ def execute_release_seat(lock_id: str, user_id: str) -> bool:
         conn.close()
 
 
+# TASK 6 EXTENSION: Rail booking finalisation uses row-level locking, active
+# reservation checks, seat-lock transfer, and pending payment creation.
 # Create a rail booking and record a pending charge transaction.
 def execute_booking(
     user_id: str,
@@ -2030,6 +2061,8 @@ def login_user(email: str, password: str) -> Optional[dict]:
 
 
 # Link an existing Google account or stage a new Google signup.
+# TASK 6 EXTENSION: Google OAuth login maps a Google identity to the local
+# TransitFlow relational user model.
 def login_or_create_google_user(
     provider_user_id: str,
     email: str,
@@ -2132,6 +2165,8 @@ def login_or_create_google_user(
         conn.close()
 
 
+# TASK 6 EXTENSION: Google OAuth signup completion creates the local user profile
+# and provider mapping after collecting required profile data.
 # Complete a pending Google signup after collecting birth year.
 def complete_google_signup(
     provider_user_id: str,

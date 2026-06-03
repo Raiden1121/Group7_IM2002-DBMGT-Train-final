@@ -14,6 +14,10 @@ Students: To extend the assistant's knowledge, add entries to the JSON files in
 train-mock-data/ and re-run this script.
 """
 
+# TASK 6 EXTENSION:
+# This file seeds extended Task 6 policy data into the policy_documents pgvector
+# table. Detailed comments are placed near document-building and seed logic.
+
 import json
 import os
 import sys
@@ -38,11 +42,15 @@ def _text(data):
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
+# TASK 6 EXTENSION: Builds pgvector policy documents from extended policy seed
+# JSON and skips marker-only records.
 def build_documents():
     docs = []
 
     # refund_policy.json — one document per policy entry
     for policy in _load("refund_policy.json"):
+        if policy.get("_task6_extension"):
+            continue
         docs.append({
             "title": policy["label"],
             "category": "refund",
@@ -52,6 +60,8 @@ def build_documents():
 
     # ticket_types.json — one document per ticket type
     for tt in _load("ticket_types.json"):
+        if tt.get("_task6_extension"):
+            continue
         docs.append({
             "title": f"Ticket Type: {tt['display_name']}",
             "category": "booking",
@@ -84,6 +94,8 @@ def build_documents():
     return docs
 
 
+# TASK 6 EXTENSION: Embeds extended policy documents and stores them in the
+# policy_documents table through store_policy_document().
 def seed():
     documents = build_documents()
     print(f"📄 Embedding {len(documents)} policy documents using {llm.chat_provider}...\n")

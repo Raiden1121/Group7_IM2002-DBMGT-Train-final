@@ -1,5 +1,9 @@
 -- ============================================================
 --  STUDENT TASK — Design and create your relational tables here
+-- TASK 6 EXTENSION:
+-- This schema includes Task 6 database structures for OAuth user mapping,
+-- temporary seat locks, pending payment workflows, journey feedback, and
+-- pgvector policy storage. Detailed comments are placed near each structure.
 --
 --  Start from the mock data in train-mock-data/:
 --    metro_stations.json, national_rail_stations.json
@@ -485,6 +489,8 @@ CREATE TABLE auth_login_audit (
     occurred_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- TASK 6 EXTENSION: Google OAuth user mapping table links external Google
+-- accounts to local TransitFlow user_profiles for database-backed login.
 CREATE TABLE user_oauth_accounts (
     -- Google OAuth account mapped to a local TransitFlow user.
     provider          TEXT NOT NULL,
@@ -621,6 +627,8 @@ WHERE reservation_status = 'active';
 -- Seat Locks and Time-based Locking Mechanisms
 -- ===========================================================================
 
+-- TASK 6 EXTENSION: seat_locks stores temporary 10-minute seat holds so two
+-- users cannot select the same national rail seat at the same time.
 -- [NEW] 新增臨時座位鎖定表 seat_locks
 -- 用來記錄訂票流程中的暫時性座位佔用。
 CREATE TABLE seat_locks (
@@ -637,12 +645,16 @@ CREATE TABLE seat_locks (
     CONSTRAINT fk_seat_locks_schedule FOREIGN KEY (schedule_id) REFERENCES service_schedules(schedule_id) ON DELETE CASCADE
 );
 
+-- TASK 6 EXTENSION: partial unique index enforces one active pending lock per
+-- schedule/date/seat combination.
 -- [NEW] 部分唯一索引 —— 業務排他鎖 (Exclusive Lock) 核心
 -- 確保同一班次、同一日期、同一座位在狀態為 pending 時，只能被一個使用者佔用
 CREATE UNIQUE INDEX uq_active_seat_lock
 ON seat_locks (schedule_id, travel_date, seat_pk)
 WHERE status = 'pending';
 
+-- TASK 6 EXTENSION: trigger automatically assigns a 10-minute expiry to each
+-- newly inserted temporary seat lock.
 -- [NEW] 自動計算過期時間的 Trigger 函數
 -- 在插入 seat_locks 時，自動將 expires_at 設定為 locked_at + 10 分鐘
 CREATE OR REPLACE FUNCTION set_seat_lock_expiry()
@@ -676,6 +688,8 @@ CREATE TABLE payment_instruments (
 );
 
 CREATE TABLE payment_transactions (
+    -- TASK 6 EXTENSION: pending payment rows support the confirm/cancel payment
+    -- workflow and timeout release for rail bookings and metro tickets.
     -- [PK design decision: TEXT] Natural payment transaction slip number (such as 'PM-9K4N2D').
     payment_id            TEXT PRIMARY KEY,
     -- [FK cascade behaviour: ON DELETE CASCADE] When the parent order is deleted, related payment transaction records are automatically cascaded and deleted to prevent isolated transaction records (孤立交易記錄).
@@ -697,6 +711,8 @@ CREATE TABLE payment_transactions (
 -- H. Feedback
 -- ---------------------------------------------------------------------------
 CREATE TABLE journey_feedback (
+    -- TASK 6 EXTENSION: journey_feedback supports owned feedback submission and
+    -- prevents duplicate feedback per user journey.
     -- [PK design decision: TEXT] feedback serial number
     feedback_id    TEXT PRIMARY KEY,
     -- [FK cascade behaviour: ON DELETE CASCADE] When the parent travel journey or user profile is hard deleted, the corresponding feedback rating content is also cascaded and deleted.
@@ -752,6 +768,8 @@ CREATE TABLE refund_policy_windows (
 -- embedding providers may return different dimensions. For a large production
 -- system, set a fixed dimension and add an IVFFLAT/HNSW index.
 CREATE TABLE policy_documents (
+    -- TASK 6 EXTENSION: extended policy seed JSON is embedded into this pgvector
+    -- table for semantic policy search.
     id           BIGSERIAL PRIMARY KEY,
     title        TEXT NOT NULL,
     category     TEXT NOT NULL,

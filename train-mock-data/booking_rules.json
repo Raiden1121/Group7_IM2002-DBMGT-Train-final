@@ -1,4 +1,5 @@
 {
+  "_task6_extension": "TASK 6 EXTENSION: Extended booking-rule seed data for pgvector RAG, including senior, student, group, promotional, and booking-condition policies.",
   "version": "1.0",
   "last_updated": "2024-01-01",
   "national_rail": {

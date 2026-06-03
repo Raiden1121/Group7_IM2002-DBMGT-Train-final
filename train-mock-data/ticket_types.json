@@ -1,5 +1,8 @@
 [
   {
+    "_task6_extension": "TASK 6 EXTENSION: Extended ticket policy seed data for pgvector RAG, including group fare tiers and richer ticket conditions."
+  },
+  {
     "ticket_type": "single",
     "display_name": "Single Ticket",
     "available_on": [
