@@ -477,6 +477,8 @@ CREATE TABLE user_recovery_factors (
     revoked_at          TIMESTAMPTZ NULL
 );
 
+-- TASK 6 EXTENSION: auth_login_audit keeps account-login history so users can
+-- review their own recent sign-in attempts without exposing sensitive hashes.
 CREATE TABLE auth_login_audit (
     -- [PK design decision: BIGSERIAL] Logging security audit records, using an auto-increment serial number to provide high-efficiency write performance.
     audit_id               BIGSERIAL PRIMARY KEY,

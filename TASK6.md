@@ -137,6 +137,10 @@ Section 7 style Task 6 write-up containing:
 - example queries
 - testing evidence
 
+## `.env`
+
+請將文件中的 Google OAuth 憑證 輸入 .env 檔案中
+
 ## Marker Formats
 
 - SQL files use `-- TASK 6 EXTENSION:`.

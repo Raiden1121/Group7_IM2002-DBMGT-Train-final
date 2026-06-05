@@ -390,6 +390,7 @@ TOOLS = [
         },
         "required": ["schedule_id", "origin_station_id", "destination_station_id", "travel_date"],
     },
+    # TASK 6 EXTENSION: Exposes only the logged-in user's own login audit history.
     {
         "name": "get_my_login_history",
         "description": (
@@ -581,6 +582,8 @@ def _execute_tool(
             )
             result = data if ok else {"error": data}
 
+        # TASK 6 EXTENSION: Dispatches login-audit lookup using the current
+        # session user, preventing users from requesting another user's audit log.
         # Added tool dispatch: login audit lookup for the logged-in user only.
         elif tool_name == "get_my_login_history":
             if not current_user_email:

@@ -1188,6 +1188,8 @@ def buy_metro_ticket(
         conn.close()
 
 
+# TASK 6 EXTENSION: Login-audit lookup is scoped to the current user and omits
+# ip_hash/user_agent_hash so assistant responses do not expose sensitive data.
 # Fetch recent login audit entries for one user only.
 def query_my_login_audit(user_id: str, limit: int = 10) -> list[dict]:
     """Return the user's own login audit results without IP or user-agent hashes."""
@@ -2010,6 +2012,8 @@ def register_user(
         conn.close()
 
 
+# TASK 6 EXTENSION: Password login writes success/failed/locked audit records so
+# users can later inspect their own account sign-in history.
 # Verify a password login and write an audit result for the attempt.
 def login_user(email: str, password: str) -> Optional[dict]:
     """
@@ -2033,6 +2037,8 @@ def login_user(email: str, password: str) -> Optional[dict]:
           ON c.user_id = u.user_id
         WHERE u.email = %s
     """
+    # TASK 6 EXTENSION: Audit rows intentionally store NULL IP/user-agent hashes
+    # in this teaching app while preserving result/timestamp evidence.
     audit_sql = """
         INSERT INTO auth_login_audit (
             user_id, login_email_attempted, ip_hash, user_agent_hash, result, occurred_at
