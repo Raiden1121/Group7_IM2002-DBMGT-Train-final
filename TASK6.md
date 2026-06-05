@@ -139,7 +139,7 @@ Section 7 style Task 6 write-up containing:
 
 ## `.env`
 
-請將文件中的 Google OAuth 憑證 輸入 .env 檔案中
+請將 Design Document中的 Google OAuth 憑證 輸入 .env 檔案中
 
 ## Marker Formats
 
