@@ -85,7 +85,8 @@ _STATION_INDEX: dict[str, str] = {
     "redwood":        "MS19", "thornton":    "MS20",
     # National Rail (longer/specific names first so they match before shorter substrings)
     "central station":   "NR01", "maplewood":     "NR02",
-    "old town junction": "NR03", "ashford":        "NR04",
+    "old town junction": "NR03", "old town jn":    "NR03",
+    "ashford":           "NR04",
     "stonehaven":        "NR05", "bridgeport":     "NR06",
     "ferndale halt":     "NR07", "coalport":       "NR08",
     "dunmore":           "NR09", "langford end":   "NR10",
@@ -99,17 +100,28 @@ def _inject_station_ids(text: str) -> str:
     Longer names are substituted first so 'Old Town Junction' beats 'Old Town'.
     Returns the original text unchanged when no stations are found.
     """
-    result = text
+    matches: list[tuple[int, int, str, str]] = []
+    for name, sid in _STATION_INDEX.items():
+        pattern = re.compile(r'(?<!\w)' + re.escape(name) + r'(?!\w)', re.IGNORECASE)
+        for match in pattern.finditer(text):
+            matches.append((match.start(), match.end(), name, sid))
+
+    if not matches:
+        return text
+
+    result_parts: list[str] = []
+    last_end = 0
     seen_ids: set[str] = set()
-    for name in sorted(_STATION_INDEX, key=len, reverse=True):
-        sid = _STATION_INDEX[name]
-        if sid in seen_ids:
+    for start, end, name, sid in sorted(matches, key=lambda m: (m[0], -(m[1] - m[0]))):
+        if start < last_end or sid in seen_ids:
             continue
-        pattern = re.compile(re.escape(name), re.IGNORECASE)
-        if pattern.search(result):
-            result = pattern.sub(f"{name} ({sid})", result)
-            seen_ids.add(sid)
-    return result
+        result_parts.append(text[last_end:start])
+        result_parts.append(f"{text[start:end]} ({sid})")
+        last_end = end
+        seen_ids.add(sid)
+
+    result_parts.append(text[last_end:])
+    return "".join(result_parts)
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -474,6 +486,8 @@ def _execute_tool(
             result = query_national_rail_availability(**params)
 
         elif tool_name == "get_national_rail_fare":
+            if not params.get("fare_class"):
+                params["fare_class"] = "standard"
             result = query_national_rail_fare(**params)
 
         elif tool_name == "check_metro_availability":
@@ -899,13 +913,18 @@ submit_feedback: call when logged-in user gives a new rating, stars, review, or 
 get_feedback: read-only; call when logged-in user asks to show/list/view/check feedback they have submitted. Never pass rating/comment to get_feedback.
 buy_metro_ticket: call when logged-in user wants to buy, purchase, book, or get a metro ticket/day pass and provides schedule, stations, and date. Payment method ID is optional; omit it for pending payment.
 get_my_login_history: call only when logged-in user explicitly asks about login history, sign-in history, or audit records.
+get_national_rail_fare: call directly when the user asks for national rail fare/price/cost and provides schedule_id plus stops_travelled. Include fare_class as standard or first.
 make_booking: call when logged-in user books national rail and explicitly provides schedule_id.
 make_booking_by_route: call when logged-in user books national rail using origin, destination, date, and fare class but no schedule_id.
-cancel_booking: only if user is logged in and asks to cancel a booking.
+cancel_booking: call when logged-in user explicitly asks to cancel/cancelled/cancellation a booking and provides a BK reference.
+Cancellation priority: "Cancel my booking BK-..." means cancel_booking with booking_id. Do not use get_payment_info, get_user_bookings, search_policy, make_booking, or make_booking_by_route for direct cancellation commands.
+Refund/payment wording only uses get_payment_info when the user asks to check/view/status of refund or payment, not when they ask to cancel.
+find_alternative_routes: call when the user asks for alternative routes because a station is closed, blocked, unavailable, disrupted, or should be avoided. Use the closed/avoided station as avoid_station_id.
 Route/path/journey questions: use find_route. Policy questions: use search_policy.
 Policy/RAG questions include rules, procedures, eligibility, passenger rights, travel conditions, refunds, compensation, lost property, claiming items, customer service, accessibility, luggage, bicycles, pets, food, drink, conduct, fare evasion, ticket validity, discounts, group bookings, and deadlines.
 Use search_policy for policy/RAG intent even if the message mentions trains, tickets, booking, metro, or national rail.
 Priority: policy intent uses search_policy. Purchase intent uses buy_metro_ticket, not check_metro_availability. New rating/comment intent uses submit_feedback, not get_feedback. Show/list/view submitted feedback uses get_feedback, not submit_feedback.
+Priority: direct cancellation intent with a BK reference uses cancel_booking before any other booking, payment, refund, or policy tool.
 Never use "" as a param value. Omit optional params if unknown.
 
 TOOLS:
@@ -926,6 +945,9 @@ Examples:
 "hello" -> {{"tool_calls": []}}
 "show my bookings" -> {{"tool_calls": [{{"name": "get_user_bookings", "params": {{}}}}]}}
 "payment status of BK001" -> {{"tool_calls": [{{"name": "get_payment_info", "params": {{"booking_id": "BK001"}}}}]}}
+"Cancel my booking BK-3CB1QV" -> {{"tool_calls": [{{"name": "cancel_booking", "params": {{"booking_id": "BK-3CB1QV"}}}}]}}
+"What is the standard fare on NR_SCH01 for 4 stops?" -> {{"tool_calls": [{{"name": "get_national_rail_fare", "params": {{"schedule_id": "NR_SCH01", "fare_class": "standard", "stops_travelled": 4}}}}]}}
+"If Old Town JN station (NR03) is closed, what alternative routes exist from NR01 to NR05?" -> {{"tool_calls": [{{"name": "find_alternative_routes", "params": {{"origin_id": "NR01", "destination_id": "NR05", "avoid_station_id": "NR03", "network": "rail"}}}}]}}
 "book me a standard ticket NR01 to NR05 on 2025-06-01" -> {{"tool_calls": [{{"name": "make_booking_by_route", "params": {{"origin_station_id": "NR01", "destination_station_id": "NR05", "travel_date": "2025-06-01", "fare_class": "standard"}}}}]}}
 "delay ripple from Central Station (NR01) within a 3-hop radius" -> {{"tool_calls": [{{"name": "get_delay_ripple", "params": {{"station_id": "NR01", "hops": 3}}}}]}}
 
@@ -948,15 +970,18 @@ JSON:"""
                 "Explicit account login/sign-in history or audit log → get_my_login_history. "
                 "Buy/purchase/book/get a metro ticket or day pass with schedule, stations, and date → buy_metro_ticket. "
                 "Do not use check_metro_availability for confirmed metro purchase requests. "
+                "National rail fare/price/cost with schedule_id and stops → get_national_rail_fare with schedule_id, fare_class, and stops_travelled. "
                 "Book national rail with route/date/fare but no schedule_id → make_booking_by_route. "
                 "Book national rail with schedule_id → make_booking. "
-                "Cancel a booking → cancel_booking. "
+                "Direct cancellation commands like 'Cancel my booking BK-3CB1QV' → cancel_booking with booking_id. "
+                "For cancel/cancelled/cancellation + BK reference, never call get_payment_info, get_user_bookings, search_policy, make_booking, or make_booking_by_route. "
                 "Policy/rules/procedures/eligibility/passenger rights/refunds/compensation/lost property/claiming items/customer service/accessibility/luggage/bicycle/pets/food/drink/conduct/fare evasion/discounts/group booking/deadlines/conditions → search_policy. "
                 "Use search_policy for policy/RAG intent even when the message also mentions trains, tickets, booking, metro, or national rail. "
+                "Alternative route questions with closed/blocked/unavailable/avoid station → find_alternative_routes with origin_id, destination_id, and avoid_station_id. "
                 "Route/directions/fastest/quickest/how-to-get/path questions → find_route ONLY (never get_metro_fare). "
                 "Delay ripple/disruption/system failure/affected-station questions → get_delay_ripple with station_id and hops if stated. "
                 "Metro fare/price/cost/how-much-does-it-cost questions → get_metro_fare. "
-                "Rail fare/cost/price questions → check_national_rail_availability then get_national_rail_fare. "
+                "Rail fare/cost/price questions with origin/destination/date → check_national_rail_availability then get_national_rail_fare. "
                 "Schedule/timetable/trains/services questions → check_national_rail_availability or check_metro_availability. "
                 "Only call a tool when needed. Output nothing except tool calls."
             ),
@@ -1060,17 +1085,65 @@ JSON:"""
     _route_triggers = {"fastest route", "quickest route", "shortest route", "cheapest route",
                        "best route", "how to get", "directions from", "route from", "route to",
                        "get from", "travel from", "way from", "path from"}
+    _alternative_route_triggers = {
+        "alternative route", "alternative routes", "alternate route", "alternate routes",
+        "avoid", "avoiding", "closed", "closure", "blocked", "unavailable", "out of service",
+    }
     _is_route = (
         any(kw in _lower for kw in _route_triggers) or
         (_two_stations and "route" in _lower)
     )
+    _is_alternative_route = any(kw in _lower for kw in _alternative_route_triggers)
     _booking_triggers = {"book", "booking", "reserve", "reservation"}
     _rail_schedule_match = re.search(r'\bNR_SCH\d{2}\b', _augmented_message, re.IGNORECASE)
     _is_rail_booking = (
         any(kw in _lower for kw in _booking_triggers)
         and (_rail_schedule_match or "national rail" in _lower or (_two_stations and _station_ids_unique[0].startswith("NR")))
     )
-    if _is_route and _two_stations and not _tool_selected("find_route", "origin_id", "destination_id"):
+    _from_to_match = re.search(
+        r'\bfrom\s+(MS\d{2}|NR\d{2})\s+to\s+(MS\d{2}|NR\d{2})\b',
+        _augmented_message,
+        re.IGNORECASE,
+    )
+    _avoid_match = re.search(
+        r'\b(MS\d{2}|NR\d{2})\b[^.?!,;]{0,50}\b(?:is\s+)?(?:closed|blocked|unavailable|out\s+of\s+service)\b',
+        _augmented_message,
+        re.IGNORECASE,
+    ) or re.search(
+        r'\b(?:avoid|avoiding)\b[^.?!,;]{0,50}\b(MS\d{2}|NR\d{2})\b',
+        _augmented_message,
+        re.IGNORECASE,
+    )
+    if _is_alternative_route and _from_to_match and _avoid_match:
+        _origin_id = _from_to_match.group(1).upper()
+        _destination_id = _from_to_match.group(2).upper()
+        _avoid_station_id = _avoid_match.group(1).upper()
+        _network = "rail" if _origin_id.startswith("NR") and _destination_id.startswith("NR") else "auto"
+        _alt_call = next((c for c in tool_calls if c.get("name") == "find_alternative_routes"), None)
+        _alt_params = (_alt_call or {}).get("params") or {}
+        if (
+            not _tool_selected("find_alternative_routes", "origin_id", "destination_id", "avoid_station_id")
+            or _alt_params.get("origin_id", "").upper() != _origin_id
+            or _alt_params.get("destination_id", "").upper() != _destination_id
+            or _alt_params.get("avoid_station_id", "").upper() != _avoid_station_id
+        ):
+            _fallback(
+                "find_alternative_routes",
+                {
+                    "origin_id": _origin_id,
+                    "destination_id": _destination_id,
+                    "avoid_station_id": _avoid_station_id,
+                    "network": _network,
+                },
+                "alternative route query",
+            )
+
+    elif (
+        _is_route
+        and _two_stations
+        and not _is_alternative_route
+        and not _tool_selected("find_route", "origin_id", "destination_id")
+    ):
         _opt = "cost" if any(kw in _lower for kw in ["cheap", "cheapest", "lowest cost"]) else "time"
         _fallback("find_route",
                   {"origin_id": _station_ids_unique[0], "destination_id": _station_ids_unique[1], "optimise_by": _opt},
@@ -1222,6 +1295,9 @@ JSON:"""
             )
             if not _payment_was_requested and not _payment_id_text.startswith(("PMI-", "PI")):
                 params.pop("payment_instrument_id", None)
+
+        if tool_name == "get_national_rail_fare" and not params.get("fare_class"):
+            params["fare_class"] = "standard"
 
         # Skip calls with remaining empty required values — LLM failed to extract params
         if any(v == "" for v in params.values()):
